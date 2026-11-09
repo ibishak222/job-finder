@@ -1,0 +1,10 @@
+# Runtime dependencies for Streamlit Community Cloud (and other hosts that install requirements.txt).
+# Same as requirements.txt minus test-only tools; the Pinggy tunnel (requirements-public.txt) is NOT needed.
+requests>=2.28
+beautifulsoup4>=4.11
+lxml>=4.9
+streamlit>=1.46
+pandas>=2.0
+openpyxl>=3.1
+extruct>=0.17
+dateparser>=1.2

@@ -1,0 +1,1 @@
+# Do-not-contact list: one email, @domain, profile URL or GitHub username per line.
