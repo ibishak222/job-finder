@@ -8,6 +8,7 @@ import pandas as pd
 from recruit_scraper.display import format_salary
 from recruit_scraper.models import Job
 from recruit_scraper.presets import PRESET_COMPANIES
+from recruit_scraper.utils import contract_bucket
 from ui_common import to_csv_bytes, to_excel_bytes, to_json_bytes
 
 # name -> (friendly label, one-line hint, on by default)
@@ -25,6 +26,8 @@ SOURCE_INFO = {
     "remoteok": ("Remote OK", "Popular remote-jobs board, mostly tech.", True),
     "arbeitnow": ("Arbeitnow", "Large job board, mostly Germany/EU plus remote roles.", True),
     "jsonld": ("Any careers page (paste links)", "Reads job details from careers pages you paste below.", True),
+    "nhsjobs": ("NHS Jobs (UK)", "NHS and NHS-funded jobs in England & Wales (nurses, HCAs, admin, doctors…). "
+                "Shows Permanent / Fixed-term / Bank / Locum.", True),
     "reed": ("Reed.co.uk (UK)", "Big UK job board – needs a free Reed API key.", True),
     "adzuna": ("Adzuna (UK)", "UK job search engine – needs a free Adzuna app ID + key.", True),
 }
@@ -48,6 +51,7 @@ def jobs_to_frame(jobs: list[dict]) -> pd.DataFrame:
     df["posted_date"] = pd.to_datetime(df["posted_date"], errors="coerce").dt.date
     df["where_found"] = df["source"].map(source_label)
     df["remote"] = df["remote"].map({True: "Yes", False: "No"}).fillna("")
+    df["contract"] = [contract_bucket(t) for t in df["employment_type"]]
     for c in ("company", "location", "employment_type", "contact_email", "contact_phone", "description"):
         df[c] = df[c].fillna("")
     return df

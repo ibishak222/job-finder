@@ -72,6 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with a UK location filter, do NOT include remote jobs open to UK candidates")
     p.add_argument("--salary-only", action="store_true", help="only keep jobs with a salary")
     p.add_argument("--remote-only", action="store_true", help="only keep remote jobs")
+    p.add_argument("--contract", choices=["any", "permanent", "temporary"], default="any",
+                   help="permanent, or temporary = locum / bank / agency / temp / contract / fixed-term (as the ad says)")
     p.add_argument("--no-contacts", action="store_true",
                    help="drop contact_email (recruiter emails published in postings) from the export")
     p.add_argument("--list-sources", action="store_true", help="list available sources and exit")
@@ -121,7 +123,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     res = search(selected, keywords=keywords, locations=locations, companies=companies, urls=urls,
                  max_results=args.max_results, max_per_source=args.max_per_source, delay=args.delay,
                  follow_links=args.follow_links, user_agent=args.user_agent, salary_only=args.salary_only,
-                 remote_only=args.remote_only, remote_uk=not args.no_remote_uk, hide_contacts=args.no_contacts, progress=progress)
+                 remote_only=args.remote_only, remote_uk=not args.no_remote_uk, hide_contacts=args.no_contacts, progress=progress,
+                 contract=args.contract)
     jobs = res.jobs
     stats = {r.name: (f"fetched {r.fetched}, matched {r.matched}" if r.status == "ok" else r.status)
              + (f" ({r.message})" if r.message and r.status == "ok" else f": {r.message}" if r.message else "")

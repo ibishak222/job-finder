@@ -28,7 +28,7 @@ from ..http import HttpClient
 from .cache import DiskCache
 from .contacts import SiteContactFinder
 from .geo import Place, PlaceGeocoder, haversine_miles, looks_non_uk
-from .matching import RoleMatcher, find_place, place_terms, years_from_text
+from .matching import RoleMatcher, contract_type, find_place, place_terms, years_from_text
 from .models import Candidate
 
 log = logging.getLogger(__name__)
@@ -64,6 +64,9 @@ class _BioProvider:
                       "website_emails": 0}
         self.cache = DiskCache(f"{self.name}_search", 86400)
         self._site_http = site_http
+
+    def extra_people(self, matcher: RoleMatcher, progress) -> dict[str, dict]:
+        return {}
 
     # subclasses return dicts: {id, name, handle, url, bio, location, links[]}
     def _search(self, q: str, page: int, state: dict) -> list[dict]:
@@ -108,6 +111,8 @@ class _BioProvider:
                geocoder: PlaceGeocoder, progress: Callable[[str], None] = lambda m: None) -> Iterator[Candidate]:
         matcher = RoleMatcher(title, keywords)
         people = self._collect(self.queries(matcher, place), progress)
+        for k, v in self.extra_people(matcher, progress).items():
+            people.setdefault(k, v)
         self.stats["profiles_seen"] = len(people)
         pterms = place_terms(place)
         cands: list[Candidate] = []
@@ -143,7 +148,7 @@ class _BioProvider:
                 profile_url=p["url"], website=site,
                 linkedin_url=next((u for u in p.get("links") or [] if "linkedin.com/in/" in u.lower()), ""),
                 kind="candidate", provider=self.name, profile_read=True,
-                match_score=m.score, match_reason=m.reason,
+                match_score=m.score, match_reason=m.reason, contract=contract_type(p.get("bio") or ""),
                 other_profiles=" ".join(u for u in (p.get("links") or []) if u != site)[:500]))
         if self.fetch_websites:
             with_site = [c for c in cands if c.website]
@@ -176,6 +181,8 @@ class BlueskyProvider(_BioProvider):
     label = "Bluesky"
     BASE = "https://public.api.bsky.app/xrpc"
 
+    max_packs = 4
+
     def __init__(self, *a, client=None, **kw):
         super().__init__(*a, **kw)
         self._client = client
@@ -196,23 +203,74 @@ class BlueskyProvider(_BioProvider):
         res = self.client().app.bsky.actor.search_actors(params)
         state["cursor"] = getattr(res, "cursor", None)
         state["more"] = bool(state["cursor"])
-        out = []
-        for a in res.actors or []:
-            labels = [getattr(lb, "val", "") for lb in (getattr(a, "labels", None) or [])]
-            if "!no-unauthenticated" in labels:
-                continue  # they asked not to be shown to logged-out viewers
-            bio = a.description or ""
-            out.append({"id": a.did, "name": a.display_name or a.handle, "handle": a.handle,
-                        "url": f"https://bsky.app/profile/{a.handle}", "bio": bio, "location": "",
-                        "links": list(dict.fromkeys(u.rstrip(".,;") for u in _URL.findall(bio)))})
-        return out
+        return [d for d in (self._person(a) for a in res.actors or []) if d]
+
+    @staticmethod
+    def _person(a) -> Optional[dict]:
+        labels = [getattr(lb, "val", "") for lb in (getattr(a, "labels", None) or [])]
+        if "!no-unauthenticated" in labels:
+            return None  # they asked not to be shown to logged-out viewers
+        bio = getattr(a, "description", None) or ""
+        return {"id": a.did, "name": a.display_name or a.handle, "handle": a.handle,
+                "url": f"https://bsky.app/profile/{a.handle}", "bio": bio, "location": "",
+                "links": list(dict.fromkeys(u.rstrip(".,;") for u in _URL.findall(bio)))}
+
+    def extra_people(self, matcher: RoleMatcher, progress) -> dict[str, dict]:
+        """Members of public Bluesky *starter packs* made for this profession (e.g. 'UK nurses', 'Legal Bluesky')."""
+        key = f"packs|{matcher.core}"
+        hit = self.cache.get(key)
+        if hit is not None:
+            return hit
+        people: dict[str, dict] = {}
+        try:
+            c = self.client()
+            packs = []
+            for term in matcher.search_terms(2):
+                progress(f"Bluesky: looking for '{term}' starter packs…")
+                time.sleep(0.3)
+                res = c.app.bsky.graph.search_starter_packs({"q": term, "limit": 25})
+                for sp in res.starter_packs or []:
+                    rec = sp.record
+                    name = f"{getattr(rec, 'name', '')} {getattr(rec, 'description', '') or ''}"
+                    if matcher.match(name).score and sp.uri not in [p.uri for _, p in packs]:
+                        uk = 1 if re.search(r"\b(uk|britain|british|england|scotland|wales|nhs|london)\b", name, re.I) else 0
+                        packs.append((uk, sp))
+            packs = [sp for _, sp in sorted(packs, key=lambda x: -x[0])][: self.max_packs]
+            for sp in packs:
+                time.sleep(0.3)
+                full = c.app.bsky.graph.get_starter_pack({"starter_pack": sp.uri}).starter_pack
+                lst = getattr(full, "list", None)
+                if not lst:
+                    continue
+                cursor = None
+                for _ in range(2):
+                    time.sleep(0.3)
+                    params = {"list": lst.uri, "limit": 100}
+                    if cursor:
+                        params["cursor"] = cursor
+                    page = c.app.bsky.graph.get_list(params)
+                    for it in page.items or []:
+                        d = self._person(it.subject)
+                        if d:
+                            people.setdefault(d["id"], d)
+                    cursor = getattr(page, "cursor", None)
+                    if not cursor:
+                        break
+            self.stats["starter_packs"] = len(packs)
+        except Exception as e:  # noqa: BLE001
+            log.warning("bluesky starter packs failed: %s", e)
+            self.notes.append(f"starter packs: {str(e)[:100]}")
+            return people
+        self.cache.set(key, people)
+        return people
 
 
 class MastodonProvider(_BioProvider):
     name = "mastodon"
     label = "Mastodon"
     pages = 1
-    DEFAULT_SERVERS = ("mastodon.social", "mastodonapp.uk")
+    # big general servers + UK-focused ones (all allow unauthenticated account search; robots.txt allows /api/v2)
+    DEFAULT_SERVERS = ("mastodon.social", "mastodonapp.uk", "mastodon.scot", "toot.wales", "mstdn.social")
 
     def __init__(self, *a, servers: tuple[str, ...] = DEFAULT_SERVERS, factory=None, **kw):
         super().__init__(*a, **kw)

@@ -12,6 +12,23 @@ from typing import Callable, Optional
 from .http import HttpClient
 from .models import Job
 from .sources import SOURCES
+from .utils import contract_bucket, detect_employment_type
+
+_CONTRACT_WORDS = {"locum": "temporary", "bank": "temporary", "agency": "temporary", "temp": "temporary",
+                   "temporary": "temporary", "contract": "temporary", "contractor": "temporary",
+                   "freelance": "temporary", "interim": "temporary", "permanent": "permanent", "perm": "permanent"}
+
+
+def split_contract_words(keywords: list[str]) -> tuple[list[str], str]:
+    """Pull contract words out of keyword phrases: ['locum nurse'] -> (['nurse'], 'temporary')."""
+    out, kinds = [], set()
+    for k in keywords:
+        words = k.split()
+        rest = [w for w in words if w.lower() not in _CONTRACT_WORDS]
+        kinds |= {_CONTRACT_WORDS[w.lower()] for w in words if w.lower() in _CONTRACT_WORDS}
+        if rest:
+            out.append(" ".join(rest))
+    return out, (kinds.pop() if len(kinds) == 1 else "")
 
 log = logging.getLogger("recruit_scraper")
 
@@ -75,13 +92,18 @@ def search(sources: list[str], *, keywords: list[str] = (), locations: list[str]
            max_per_source: int = 0, delay: float = 1.0, follow_links: int = 25,
            user_agent: Optional[str] = None, salary_only: bool = False, remote_only: bool = False,
            hide_contacts: bool = False, api_keys: Optional[dict] = None, workers: int = 8, remote_uk: bool = True,
-           progress: Optional[ProgressFn] = None, cancel=None) -> SearchResult:
+           progress: Optional[ProgressFn] = None, cancel=None, contract: str = "any") -> SearchResult:
     """Run the selected sources and return de-duplicated, filtered, interleaved jobs.
 
     `cancel` is an optional threading.Event; when set, sources stop at the next job and the partial results return."""
     keywords, locations = list(keywords), list(locations)
+    # "locum nurse" -> match ads for "nurse" whose contract is locum/temp (contract words rarely all appear in ads)
+    kw_hint_raw = keywords[0] if len(keywords) == 1 else None
+    keywords, inferred = split_contract_words(keywords)
+    if contract in ("any", "", None) and inferred:
+        contract = inferred
     http = HttpClient(user_agent=user_agent, min_interval=delay)
-    kw_hint = keywords[0] if len(keywords) == 1 else None
+    kw_hint = kw_hint_raw if kw_hint_raw is not None else (keywords[0] if len(keywords) == 1 else None)
     loc_hint = locations[0] if len(locations) == 1 and locations[0].lower() != "remote" else None
     cap = max_per_source or None
 
@@ -117,13 +139,19 @@ def search(sources: list[str], *, keywords: list[str] = (), locations: list[str]
                 r.fetched += 1
                 if not job.url or not job.title:
                     continue
-                if not matches(job, keywords, locations, remote_uk):
+                # sources that already searched by distance around the place (NHS Jobs) skip the text place check
+                if not matches(job, keywords, [] if getattr(src, "server_side_location", False) and locations
+                               else locations, remote_uk):
                     continue
                 if salary_only and not (job.salary_min or job.salary_max):
                     continue
                 if remote_only and not job.remote:
                     continue
                 enrich_contacts(job)
+                if not job.employment_type:
+                    job.employment_type = detect_employment_type(job.title, job.description)
+                if contract in ("permanent", "temporary") and contract_bucket(job.employment_type) != contract:
+                    continue
                 kept.append(job)
                 if cap and len(kept) >= cap:
                     break

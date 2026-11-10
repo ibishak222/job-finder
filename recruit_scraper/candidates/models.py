@@ -27,7 +27,8 @@ class Candidate:
     linkedin_url: str = ""        # link only - never fetched
     twitter_url: str = ""
     hireable: Optional[bool] = None
-    kind: str = "candidate"       # candidate | hiring contact
+    kind: str = "candidate"       # candidate | hiring contact | business (a firm / sole trader listing, not a job seeker)
+    contract: str = ""            # what their own profile says: temporary (locum/agency/bank/contract) | permanent | ""
     profile_read: Optional[bool] = None  # GitHub: False = quick-list row from search, profile not read yet
     provider: str = ""            # where it was found, e.g. "github", "bluesky", "github + mastodon"
     match_score: float = 0.0      # how well their own profile text matches the job (3 exact, 2 synonym, 1 skill)

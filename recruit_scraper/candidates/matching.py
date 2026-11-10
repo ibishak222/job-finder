@@ -14,7 +14,21 @@ SYNONYMS: dict[str, list[str]] = {
     "care worker": ["carer", "care assistant", "support worker", "healthcare assistant", "domiciliary care",
                     "home carer", "senior carer", "care giver", "caregiver", "personal assistant care", "hca"],
     "support worker": ["care worker", "carer", "care assistant", "support work"],
-    "nurse": ["registered nurse", "rgn", "rmn", "staff nurse", "nursing", "midwife", "nurse practitioner"],
+    "nurse": ["registered nurse", "rgn", "rmn", "rnld", "staff nurse", "nursing", "mental health nurse",
+              "psychiatric nurse", "learning disability nurse", "theatre nurse", "scrub nurse", "icu nurse",
+              "itu nurse", "critical care nurse", "a&e nurse", "emergency nurse", "practice nurse", "district nurse",
+              "community nurse", "nurse practitioner", "anp", "ward sister", "charge nurse", "nurse manager",
+              "paediatric nurse", "rsc nurse", "midwife", "nursing associate"],
+    "registered nurse": ["rgn", "rmn", "rnld", "staff nurse", "nurse"],
+    "mental health nurse": ["rmn", "psychiatric nurse", "cpn", "community psychiatric nurse", "mental health nursing"],
+    "learning disability nurse": ["rnld", "ld nurse"],
+    "theatre nurse": ["scrub nurse", "anaesthetic nurse", "recovery nurse", "perioperative", "odp"],
+    "icu nurse": ["itu nurse", "critical care nurse", "intensive care nurse"],
+    "a&e nurse": ["emergency nurse", "ed nurse", "emergency department nurse"],
+    "practice nurse": ["gp nurse", "general practice nurse"],
+    "district nurse": ["community nurse", "community nursing"],
+    "healthcare assistant": ["hca", "health care assistant", "nursing assistant", "care assistant", "clinical support worker",
+                             "healthcare support worker"],
     "electrician": ["electrical contractor", "electrical installer", "electrical engineer", "sparky", "sparkie",
                     "electrical installation", "approved electrician", "niceic", "electrical apprentice"],
     "plumber": ["plumbing", "heating engineer", "gas engineer", "gas safe", "plumbing and heating"],
@@ -40,8 +54,15 @@ SYNONYMS: dict[str, list[str]] = {
                       "admin"],
     "cleaner": ["cleaning", "housekeeper", "housekeeping", "domestic cleaner"],
     "hairdresser": ["hair stylist", "stylist", "barber", "hairstylist"],
-    "lawyer": ["solicitor", "barrister", "paralegal", "legal counsel", "attorney"],
-    "solicitor": ["lawyer", "legal", "paralegal"],
+    "lawyer": ["solicitor", "barrister", "paralegal", "legal counsel", "attorney", "legal executive", "cilex",
+               "conveyancer", "in-house counsel", "trainee solicitor", "associate solicitor", "advocate"],
+    "solicitor": ["lawyer", "trainee solicitor", "associate solicitor", "partner solicitor", "legal counsel",
+                  "solicitor advocate"],
+    "barrister": ["counsel", "kc", "qc", "pupil barrister", "advocate", "called to the bar"],
+    "paralegal": ["legal assistant", "legal executive", "cilex", "trainee legal executive"],
+    "legal executive": ["cilex", "chartered legal executive", "paralegal"],
+    "conveyancer": ["conveyancing", "licensed conveyancer", "property lawyer", "residential property solicitor"],
+    "legal secretary": ["legal pa", "legal assistant", "legal administrator", "secretary at a law firm"],
     "pharmacist": ["pharmacy", "pharmacy technician"],
     "physiotherapist": ["physio", "physiotherapy"],
     "social worker": ["social work", "social care"],
@@ -111,30 +132,34 @@ class RoleMatcher:
 
     def __post_init__(self) -> None:
         t = _norm(self.title)
+        self.contract = contract_type(t)          # "locum nurse" -> temporary; "permanent solicitor" -> permanent
         core = _norm(SENIORITY.sub(" ", t))
-        core = re.sub(r"[^a-z0-9#+.\- ]", " ", core).strip()
+        core = CONTRACT_TEMP.sub(" ", core)
+        core = CONTRACT_PERM.sub(" ", core)
+        core = re.sub(r"[^a-z0-9#+.&\- ]", " ", core).strip()
         core = re.sub(r"\s+", " ", core)
         self.core = core or t
         self.tech = is_tech_role(t)
-        syns: list[str] = []
+        exact: list[str] = []
+        related: list[str] = []
         for key, alts in SYNONYMS.items():
-            partial = re.search(rf"\b{re.escape(key)}\b", self.core) and is_tech_role(key) == self.tech
-            if key == self.core or partial:
-                for a in [key] + alts:
-                    if a != self.core and a not in syns:
-                        syns.append(a)
-        self.synonyms = syns
+            if key == self.core:
+                exact += [a for a in alts if a != self.core]
+            elif re.search(rf"\b{re.escape(key)}\b", self.core) and is_tech_role(key) == self.tech:
+                related += [a for a in [key] + alts if a != self.core]
+        self.synonyms = list(dict.fromkeys(exact))
+        self.related = [r for r in dict.fromkeys(related) if r not in self.synonyms]
         words = [w for w in self.core.split() if w not in GENERIC and len(w) > 1]
         self.content_words = words
         self.kw = [_norm(k) for k in self.keywords if k and k.strip()]
         self._exact = _phrase_re(self.core) if self.core else None
-        self._syn = [(s, _phrase_re(s)) for s in self.synonyms]
+        self._syn = [(s, _phrase_re(s), 2.0) for s in self.synonyms] + [(s, _phrase_re(s), 1.5) for s in self.related]
         self._words = [_phrase_re(w) for w in words]
 
     def search_terms(self, n: int = 4) -> list[str]:
         """Phrases to send to a source's search box: the title first, then the most common synonyms."""
         out = [self.core]
-        for s in self.synonyms:
+        for s in self.synonyms + self.related:
             if len(out) >= n:
                 break
             if len(s) > 3 and s not in out:  # skip ambiguous acronyms like 'pa', 'ta' for searching
@@ -151,9 +176,9 @@ class RoleMatcher:
         if self._exact is not None and (mm := self._exact.search(text)):
             hit = (3.0, f"profile says '{self.core}'", mm.start())
         else:
-            for s, rx in self._syn:
+            for s, rx, sc in self._syn:
                 if mm := rx.search(text):
-                    hit = (2.0, f"profile says '{s}'", mm.start())
+                    hit = (sc, f"profile says '{s}'", mm.start())
                     break
         if hit is None:
             if len(self.content_words) >= 2 and all(rx.search(text) for rx in self._words):
@@ -172,8 +197,24 @@ class RoleMatcher:
 
 _FORMER = re.compile(r"\b(retired|former(ly)?|ex|failed|recovering|recovered|used to be|one-?time|previous life|past life)\b[\s\-,]*(\w+[\s,]+){0,3}$",
                      re.I)
-_ORG = re.compile(r"\b(we|our|us|ltd|limited|llp|plc|company|services|group|charity|organisation)\b", re.I)
+_ORG = re.compile(r"^\W*(we|our)\b|\b(we are|we provide|we offer|we specialise|our team|contact us|call us|"
+                  r"get in touch with us|services ltd|official account)\b", re.I)
 _PERSON = re.compile(r"\b(i|i'm|im|my|me|he/him|she/her|they/them)\b", re.I)
+
+
+CONTRACT_TEMP = re.compile(r"\b(locum|agency|bank (nurse|staff|shifts?|work)|bank|temp|temporary|contract(or|ing)?|"
+                           r"freelance|interim|fixed[- ]term|zero[- ]hours?|ad[- ]hoc|self[- ]employed|sole trader)\b", re.I)
+CONTRACT_PERM = re.compile(r"\b(permanent|perm\b|full[- ]time|salaried|substantive)", re.I)
+
+
+def contract_type(text: str) -> str:
+    """'temporary' (locum / agency / bank / temp / contract / freelance), 'permanent', or '' when not said."""
+    t = text or ""
+    if CONTRACT_TEMP.search(t):
+        return "temporary"
+    if CONTRACT_PERM.search(t):
+        return "permanent"
+    return ""
 
 
 def years_from_text(text: str) -> Optional[float]:

@@ -26,10 +26,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-exp", type=float, help="minimum years of experience (GitHub: estimated from account age)")
     p.add_argument("--max-exp", type=float, help="maximum years of experience")
     p.add_argument("-k", "--keyword", action="append", default=[], help="extra keyword that must appear in the bio/company (OR)")
-    p.add_argument("--providers", nargs="+", default=["github", "bluesky", "mastodon"],
-                   choices=["github", "bluesky", "mastodon", "job_ads"],
+    p.add_argument("--providers", nargs="+", default=["github", "bluesky", "mastodon", "openstreetmap"],
+                   choices=["github", "bluesky", "mastodon", "openstreetmap", "team_pages", "job_ads"],
                    help="github = public GitHub profiles (software jobs); bluesky / mastodon = people whose public "
-                        "bio mentions the job (any job); job_ads = hiring contacts published in job ads")
+                        "bio mentions the job (any job); openstreetmap = businesses / sole traders mapped "
+                        "for that trade (labelled 'business'); team_pages = --team-url pages; job_ads = hiring "
+                        "contacts published in job ads")
+    p.add_argument("--team-url", action="append", default=[],
+                   help="a firm's 'our people' page to read schema.org Person data from (repeatable)")
+    p.add_argument("--contract", choices=["any", "permanent", "temporary"], default="any",
+                   help="keep only people whose own profile says permanent, or temporary (locum/bank/agency/contract)")
     p.add_argument("--hireable-only", action="store_true",
                    help="only GitHub users who marked themselves 'Available for hire'")
     p.add_argument("--no-quick-list", action="store_true",
@@ -72,7 +78,7 @@ def main(argv=None) -> int:
                               all_presets=a.all_presets, company_pages=not a.no_company_pages,
                               max_profiles=a.max_profiles, max_towns=a.max_areas,
                               include_unknown_distance=a.include_unknown_distance, job_sources=a.job_sources,
-                              companies=a.companies, progress=lambda m: print("  " + m, file=sys.stderr))
+                              companies=a.companies, team_urls=a.team_url, contract=a.contract, progress=lambda m: print("  " + m, file=sys.stderr))
     except PostcodeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

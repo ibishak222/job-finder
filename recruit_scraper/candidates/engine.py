@@ -13,10 +13,14 @@ from .geo import Place, PlaceGeocoder, lookup_postcode
 from .matching import is_tech_role
 from .models import Candidate
 from .providers import GitHubProvider, JobAdContactsProvider, ProviderStop
+from .directories import OpenStreetMapProvider, TeamPageProvider
+from .matching import RoleMatcher
 from .social import BlueskyProvider, MastodonProvider
 
-PEOPLE_SOURCES = ("github", "bluesky", "mastodon")
-SOURCE_LABELS = {"github": "GitHub", "bluesky": "Bluesky", "mastodon": "Mastodon", "job_ads": "Hiring contacts"}
+PEOPLE_SOURCES = ("github", "bluesky", "mastodon", "openstreetmap")
+SOURCE_LABELS = {"github": "GitHub", "bluesky": "Bluesky", "mastodon": "Mastodon", "job_ads": "Hiring contacts",
+                 "openstreetmap": "OpenStreetMap businesses", "team_pages": "Team pages"}
+CONTRACT_CHOICES = {"any": "Any", "permanent": "Permanent", "temporary": "Locum / temp / contract"}
 
 log = logging.getLogger(__name__)
 EXPORT_DIR = Path(__file__).resolve().parents[2] / "output" / "candidates"
@@ -61,12 +65,14 @@ def merge_duplicates(cands: list[Candidate]) -> list[Candidate]:
     for c in sorted(cands, key=lambda c: -(c.match_score or 0)):
         ks = keys(c)
         hit = next((index[k] for k in ks if k in index), None)
-        if hit is None or c.kind != "candidate" or hit.kind != "candidate":
+        if hit is not None and hit.kind != c.kind:
+            hit = None  # a business listing and a person sharing a website stay separate rows
+        if hit is None or c.kind != "candidate":
             if hit is not None:
-                continue  # exact duplicate hiring contact
+                continue  # exact duplicate hiring contact / business
             out.append(c)
             for k in ks:
-                index[k] = c
+                index.setdefault(k, c)
             continue
         if c.provider not in hit.provider.split(" + "):
             hit.provider = f"{hit.provider} + {c.provider}"
@@ -74,7 +80,8 @@ def merge_duplicates(cands: list[Candidate]) -> list[Candidate]:
         if c.profile_url and _norm_link(c.profile_url) != _norm_link(hit.profile_url):
             links.append(c.profile_url)
         hit.other_profiles = " ".join(dict.fromkeys(links))
-        for f in ("email", "email_source", "phone", "website", "linkedin_url", "twitter_url", "location", "company"):
+        for f in ("email", "email_source", "phone", "website", "linkedin_url", "twitter_url", "location", "company",
+                  "contract"):
             if not getattr(hit, f) and getattr(c, f):
                 setattr(hit, f, getattr(c, f))
         if hit.distance_miles is None and c.distance_miles is not None:
@@ -86,10 +93,12 @@ def merge_duplicates(cands: list[Candidate]) -> list[Candidate]:
     return out
 
 
-def rank_key(c: Candidate, min_exp: Optional[float] = None, max_exp: Optional[float] = None):
+def rank_key(c: Candidate, min_exp: Optional[float] = None, max_exp: Optional[float] = None, contract: str = ""):
     y = c.experience_years
     exp_fit = 1 if y is None else (0 if (min_exp is None or y >= min_exp) and (max_exp is None or y <= max_exp) else 2)
-    return (c.kind != "candidate", -(c.match_score or 0), exp_fit, not c.email,
+    kind = {"candidate": 0, "business": 1}.get(c.kind, 2)
+    bonus = 0.25 if contract and c.contract == contract else 0
+    return (kind, -((c.match_score or 0) + bonus), exp_fit, not c.email,
             c.distance_miles if c.distance_miles is not None else 999)
 
 
@@ -122,7 +131,7 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
                     companies: list[str] = (), suppression_entries: Optional[list[str]] = None,
                     delay: float = 1.0, include_unread: bool = True, fetch_websites: bool = True,
                     max_wait_minutes: float = 0, max_results: int = 1000, all_presets: bool = False,
-                    company_pages: bool = True,
+                    company_pages: bool = True, team_urls: list[str] = (), contract: str = "any",
                     progress: Callable[[str], None] = lambda m: None, cancel=None) -> CandidateResult:
     if cancel is not None:  # stop at the next progress message once the user presses Cancel
         _report = progress
@@ -152,6 +161,10 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
         people.append(BlueskyProvider(fetch_websites=fetch_websites))
     if "mastodon" in providers and not hireable_only:
         people.append(MastodonProvider(fetch_websites=fetch_websites))
+    if "openstreetmap" in providers and not hireable_only:
+        people.append(OpenStreetMapProvider(fetch_websites=fetch_websites))
+    if ("team_pages" in providers or team_urls) and not hireable_only and team_urls:
+        people.append(TeamPageProvider(list(team_urls)))
     for prov in people:
         rep = ProviderReport(prov.name, "ok")
         try:
@@ -171,7 +184,9 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
         if prov.notes:
             rep.message = "; ".join(dict.fromkeys(filter(None, [rep.message] + prov.notes)))
         rep.stats = prov.stats
-        if prov.name == "github" and not tech and not rep.found:
+        if not rep.found and rep.status == "ok" and (prov.name == "github" and not tech or
+                                                     prov.name == "openstreetmap" and any("No OpenStreetMap business category"
+                                                                                          in n for n in prov.notes)):
             rep.status = "skipped"
         result.reports.append(rep)
 
@@ -200,14 +215,21 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
     uniq = merge_duplicates(found)
     entries = suppression.load() if suppression_entries is None else suppression_entries
     uniq, result.suppressed = suppression.apply(uniq, entries)
-    uniq.sort(key=lambda c: rank_key(c, min_exp, max_exp))
+    want = RoleMatcher(title).contract or ("" if contract in ("any", "", None) else contract)
+    if contract in ("permanent", "temporary"):
+        uniq = [c for c in uniq if c.kind != "candidate" or c.contract == contract]
+    uniq.sort(key=lambda c: rank_key(c, min_exp, max_exp, want))
     n_people = sum(1 for c in uniq if c.kind == "candidate")
+    n_biz = sum(1 for c in uniq if c.kind == "business")
     if not tech:
         result.coverage = (f"'{title}' isn't a software job, so GitHub (developers only) was skipped. People were "
-                           "looked for on Bluesky and Mastodon, where they describe their own job in their bio. Free "
-                           "public sources cover jobs like this thinly"
-                           + (f": only {n_people} matching people found near {place.town}." if n_people else
-                              f", and nobody near {place.town} matched.")
+                           "looked for on Bluesky (search + profession starter packs) and Mastodon, where they "
+                           "describe their own job in their bio"
+                           + (", plus businesses/sole traders mapped in OpenStreetMap" if "openstreetmap" in providers else "")
+                           + ". Free public sources cover jobs like this thinly"
+                           + (f": {n_people} matching people" if n_people else ": nobody's public profile matched")
+                           + (f" and {n_biz} businesses (firms / sole traders, not job seekers)" if n_biz else "")
+                           + f" near {place.town}."
                            + " For more reach, use the hiring contacts on the Jobs page, or a CV database "
                              "(Reed, Totaljobs or CV-Library) where jobseekers opted in to be contacted.")
     elif not n_people:

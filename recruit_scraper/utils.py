@@ -141,6 +141,7 @@ _EMP_MAP = {
     "temporary": "temporary", "temp": "temporary", "fixed term": "fixed-term", "befristeter arbeitsvertrag": "fixed-term",
     "permanent": "permanent", "unbefristeter arbeitsvertrag": "permanent", "permanent employment": "permanent",
     "intern": "internship", "internship": "internship", "praktikum": "internship",
+    "locum": "locum", "bank": "bank", "agency": "agency", "secondment": "fixed-term", "zero hours": "temporary",
     "werkstudent": "working student", "ausbildung": "apprenticeship", "apprenticeship": "apprenticeship",
 }
 
@@ -163,3 +164,38 @@ def normalise_employment_type(value: Any) -> Optional[str]:
             if f not in out:
                 out.append(f)
     return ", ".join(out) or None
+
+
+TEMP_TYPES = {"locum", "bank", "agency", "temporary", "contract", "fixed-term", "freelance"}
+_AD_TEMP = re.compile(r"\b(locum|bank (?:staff|nurse|shifts?|worker|hca|role|position)|agency (?:nurse|staff|worker)|"
+                      r"temporary (?:role|position|contract|post)|fixed[- ]term|contract role|(?:\d+|six|three|twelve)"
+                      r"[- ](?:month|week) contract|freelance)\b", re.I)
+_AD_PERM = re.compile(r"\b(permanent (?:role|position|post|contract|basis|job)|this is a permanent)\b", re.I)
+
+
+def detect_employment_type(title: str, description: str = "") -> Optional[str]:
+    """Contract type ONLY where the ad says so: 'locum'/'bank'/'agency'/'temporary'/'fixed-term' or 'permanent'."""
+    t = title or ""
+    m = re.search(r"\b(locum|bank|agency|temporary|temp|fixed[- ]term|contract|freelance|permanent|perm)\b", t, re.I)
+    if m:
+        return normalise_employment_type(m.group(1).replace("perm", "permanent") if m.group(1).lower() == "perm"
+                                          else m.group(1))
+    d = (description or "")[:4000]
+    m = _AD_TEMP.search(d)
+    if m:
+        return normalise_employment_type(m.group(1).split()[0] if m.group(1).split()[0].lower() in
+                                         ("locum", "bank", "agency", "temporary", "freelance") else
+                                         ("fixed-term" if "fixed" in m.group(1).lower() else "contract"))
+    if _AD_PERM.search(d):
+        return "permanent"
+    return None
+
+
+def contract_bucket(employment_type: Optional[str]) -> str:
+    """'permanent', 'temporary' (locum / bank / agency / temp / contract / fixed-term / freelance) or ''."""
+    parts = {p.strip() for p in (employment_type if isinstance(employment_type, str) else "").lower().split(",")}
+    if parts & TEMP_TYPES:
+        return "temporary"
+    if "permanent" in parts:
+        return "permanent"
+    return ""

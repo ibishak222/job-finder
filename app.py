@@ -64,7 +64,7 @@ def add_company(slug: str) -> None:
 
 JOB_DEFAULTS = {"j_keywords": "", "j_location": "", "j_urls": "", "j_max": 1000, "j_all_presets": True,
                 "j_remote_uk": True, "j_hide_contacts": False, "j_delay": 1.0, "j_follow": 25,
-                "j_f_text": "", "j_f_sources": [], "j_f_salary": False, "j_f_remote": False, "j_f_email": False,
+                "j_f_text": "", "j_f_sources": [], "j_f_salary": False, "j_f_remote": False, "j_f_email": False, "j_f_contract": "Any",
                 **{f"j_src_{n}": d for n, (_, _, d) in SOURCE_INFO.items()}}
 
 
@@ -281,7 +281,7 @@ def _apply_jobs(t) -> None:
     st.session_state["results"] = [j.to_dict() for j in res.jobs]
     st.session_state["searched_at"] = f"{t.label} · {datetime.now().strftime('%d %b %Y %H:%M')}"
     st.session_state["jobs_sources"] = getattr(t, "lines", [])
-    for k in ("j_f_text", "j_f_sources"):  # new search -> clear old table filters
+    for k in ("j_f_text", "j_f_sources", "j_f_contract"):  # new search -> clear old table filters
         st.session_state[k] = JOB_DEFAULTS[k]
     for k in ("j_f_salary", "j_f_remote", "j_f_email"):
         st.session_state[k] = False
@@ -323,9 +323,15 @@ def show_job_results() -> None:
     only_remote = g2.toggle("Only remote", key="j_f_remote")
     only_email = g3.toggle("Only with contact email", key="j_f_email", disabled=hide_contacts)
 
+    contract = st.radio("Contract type", ["Any", "Permanent", "Locum / temp / contract"], horizontal=True,
+                        key="j_f_contract",
+                        help="Uses the ad's own contract type (e.g. NHS Jobs: Permanent / Fixed-Term / Bank / Locum) "
+                             "or words in the title/ad like 'locum', 'bank', 'agency', 'fixed term', 'permanent'. "
+                             "Ads that don't say are hidden when this is set.")
+
     def reset_filters():
         st.session_state.update({"j_f_text": "", "j_f_sources": [], "j_f_salary": False, "j_f_remote": False,
-                                 "j_f_email": False})
+                                 "j_f_email": False, "j_f_contract": "Any"})
     g4.button("Reset filters", on_click=reset_filters, key="jobs_reset_filters")
 
     view = df
@@ -338,6 +344,8 @@ def show_job_results() -> None:
         view = view[mask]
     if srcs:
         view = view[view["where_found"].isin(srcs)]
+    if contract != "Any" and "contract" in view.columns:
+        view = view[view["contract"] == ("permanent" if contract == "Permanent" else "temporary")]
     if only_salary:
         view = view[view["salary"] != ""]
     if only_remote:
