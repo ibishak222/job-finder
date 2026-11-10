@@ -50,6 +50,7 @@ class CandidateResult:
     coverage: str = ""   # friendly note when public sources cover this kind of job poorly
     contact_summary: str = ""  # e.g. "5 of 40 people published an email…"
     research_note: str = ""    # shown when Europe PMC research contacts are in the results
+    research_count: int = 0    # Europe PMC research contacts (counted separately from candidates)
     employers: list[EmployerLead] = field(default_factory=list)   # organisations to contact - NOT candidates
     employers_note: str = ""
 
@@ -249,17 +250,23 @@ def score_fit(c: Candidate, radius: float, min_exp: Optional[float] = None, max_
     return c
 
 
+def is_research_only(c: Candidate) -> bool:
+    """A Europe PMC research contact not also found as a person on a social profile."""
+    return c.provider == "europepmc"
+
+
 def _uk_only(c: Candidate) -> bool:
     return "no nearby town mentioned" in (c.location or "")
 
 
 def rank_key(c: Candidate, min_exp: Optional[float] = None, max_exp: Optional[float] = None, contract: str = ""):
-    """Best matches first: people, then businesses, then hiring contacts; within each, highest fit score."""
+    """Best matches first: people (real candidates, then Europe PMC research contacts), then businesses, then hiring
+    contacts; within each, highest fit score."""
     y = c.experience_years
     exp_fit = 1 if y is None else (0 if (min_exp is None or y >= min_exp) and (max_exp is None or y <= max_exp) else 2)
     kind = {"candidate": 0, "business": 1}.get(c.kind, 2)
     bonus = 0.25 if contract and c.contract == contract else 0
-    return (kind, _uk_only(c), -(c.fit or 0), -((c.match_score or 0) + bonus), exp_fit, not c.email,
+    return (kind, is_research_only(c), _uk_only(c), -(c.fit or 0), -((c.match_score or 0) + bonus), exp_fit, not c.email,
             c.distance_miles if c.distance_miles is not None else 999)
 
 
@@ -420,16 +427,20 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
     n_msg = add_message_links(uniq)
     if any(c.provider.split(" + ")[0] == "europepmc" or "europepmc" in c.provider for c in uniq):
         result.research_note = RESEARCH_NOTE
-    people_rows = [c for c in uniq if c.kind == "candidate"]
-    if people_rows:
+    research = [c for c in uniq if c.kind == "candidate" and is_research_only(c)]
+    result.research_count = len(research)
+    people_rows = [c for c in uniq if c.kind == "candidate" and not is_research_only(c)]
+    if people_rows or research:
         n_e = sum(1 for c in people_rows if c.email)
         n_p = sum(1 for c in people_rows if c.phone)
         result.contact_summary = (f"{n_e} of {len(people_rows)} people published an email"
                                   + (f" and {n_p} a phone number" if n_p else "")
                                   + " (source page shown for each)."
                                   + (f" {n_msg} more can be messaged on Bluesky/Mastodon ('Message' link)." if n_msg
-                                     else " The rest can be messaged through their profile link."))
-    n_people = sum(1 for c in uniq if c.kind == "candidate")
+                                     else " The rest can be messaged through their profile link.")
+                                  + (f" Plus {len(research)} clinical researchers (Europe PMC) with a research "
+                                     "correspondence email, listed after the candidates." if research else ""))
+    n_people = sum(1 for c in uniq if c.kind == "candidate" and not is_research_only(c))
     n_uk = sum(1 for c in uniq if c.kind == "candidate" and "no nearby town" in (c.location or ""))
     n_biz = sum(1 for c in uniq if c.kind == "business")
     if not tech:

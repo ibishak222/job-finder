@@ -24,7 +24,7 @@ import requests
 from ..http import HttpClient
 from ..utils import find_emails
 from .cache import DiskCache
-from .directories import OVERPASS
+from .directories import OverpassUnavailable, overpass_elements, overpass_http
 from .geo import API as POSTCODES_API, Place, haversine_miles
 
 log = logging.getLogger(__name__)
@@ -176,7 +176,7 @@ class EmployerLeadsFinder:
                  max_districts: int = 15, max_details: int = 40, max_leads: int = 150, max_geocode: int = 600,
                  osm_radius_miles: float = 6):
         self.http = http or HttpClient(min_interval=0.3, timeout=30, retries=2, backoff=2)
-        self.osm_http = osm_http or HttpClient(min_interval=2.0, timeout=45, retries=1, backoff=2)  # don't stall the search
+        self.osm_http = osm_http or overpass_http()  # short timeouts + overall budget: don't stall the search
         self.max_districts, self.max_details, self.max_leads = max_districts, max_details, max_leads
         self.max_geocode, self.osm_radius = max_geocode, osm_radius_miles
         self.cache = DiskCache("employers", 7 * 86400)
@@ -295,7 +295,7 @@ class EmployerLeadsFinder:
     def osm_query(self, kinds: list[str], place: Place, radius_miles: float) -> str:
         r = int(min(max(radius_miles, 1), 25) * 1609.344)
         parts = "".join(f"nwr{f}(around:{r},{place.lat:.5f},{place.lon:.5f});" for k in kinds for f in OSM_FILTERS.get(k, []))
-        return f"[out:json][timeout:80];({parts});out center tags 400;"
+        return f"[out:json][timeout:25];({parts});out center tags 400;"
 
     def osm_leads(self, kinds: list[str], place: Place, radius_miles: float,
                   progress: Callable[[str], None] = lambda m: None) -> list[EmployerLead]:
@@ -303,18 +303,12 @@ class EmployerLeadsFinder:
         els = self.osm_cache.get(q)
         if els is None:
             progress("OpenStreetMap: employers near the postcode…")
-            last = None
-            for url in OVERPASS:
-                try:
-                    els = self.osm_http.get_json(url, params={"data": q}).get("elements") or []
-                    self.osm_cache.set(q, els)
-                    break
-                except (requests.RequestException, ValueError) as e:
-                    last = e
-            if els is None:
-                self.notes.append("OpenStreetMap's Overpass servers didn't answer "
-                                  f"({type(last).__name__}); showing NHS ODS records only - search again later for "
-                                  "websites/phones from OpenStreetMap")
+            try:
+                els = overpass_elements(self.osm_http, q)
+                self.osm_cache.set(q, els)
+            except OverpassUnavailable as e:
+                self.notes.append(f"OpenStreetMap's Overpass servers didn't answer ({e}); showing NHS ODS records "
+                                  "only - search again later for websites/phones from OpenStreetMap")
                 return []
         out = []
         for e in els:

@@ -431,16 +431,22 @@ def _results() -> None:
     view = view.reset_index(drop=True)
 
     with st.container(key="sticky_cands"):
-        m = st.columns(6)
-        m[0].metric("People", int((df["kind"] == "candidate").sum()))
+        research = df["provider"] == "europepmc"     # research-only contacts, counted on their own
+        n_research = int((research & (df["kind"] == "candidate")).sum())
+        m = st.columns(7 if n_research else 6)
+        m[0].metric("People", int(((df["kind"] == "candidate") & ~research).sum()))
         m[1].metric("Businesses", int((df["kind"] == "business").sum()),
                     help="Firms / sole traders (OpenStreetMap), not individual job seekers")
         m[2].metric("Hiring contacts", int((df["kind"] == "hiring contact").sum()))
-        m[3].metric("With email", int((df["email"] != "").sum()),
-                    help="Only emails people published themselves (bio, own site, link-in-bio page)")
+        m[3].metric("With email", int(((df["email"] != "") & ~research).sum()),
+                    help="Only emails people published themselves (bio, own site, link-in-bio page). "
+                         "Clinical researchers' article emails are counted separately.")
         m[4].metric("Message links", int((df["message_url"] != "").sum()),
                     help="People without an email you can message on their own Bluesky/Mastodon profile")
         m[5].metric("Available for hire", int((df["hireable"] == "Yes").sum()))
+        if n_research:
+            m[6].metric("Clinical researchers", n_research,
+                        help="Europe PMC research contacts (corresponding authors), listed after the candidates")
     if (df["provider"] == "openstreetmap").any():
         st.caption("Business listings: data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, ODbL.")
     st.caption(f"Showing **{len(view)}** of {len(df)} · click a column header to sort · "

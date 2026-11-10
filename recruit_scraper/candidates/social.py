@@ -59,6 +59,30 @@ ABROAD = re.compile(r"\b(exile|expat|ex-pat|immigrant|emigrated|living abroad|us
                     r"andaluc\w*|madrid|barcelona|portugal|lisbon|italy|netherlands|amsterdam|belgium|cyprus|greece|"
                     r"sweden|norway|denmark|india|nigeria|ghana|kenya|south africa|dubai|uae|qatar|singapore|"
                     r"hong kong|japan|china|brazil|mexico)\b|🇺🇸|🇨🇦|🇦🇺|🇳🇿|🇮🇪|🇫🇷|🇩🇪|🇪🇸|🇵🇹|🇮🇹|🇳🇱|🇧🇪|🇨🇾|🇬🇷|🇮🇳|🇳🇬", re.I)
+# explicit places outside the UK that a UK town name elsewhere in the bio must not override
+# ('A native of Meath … Leeds United fan', 'apprentice electrician in Portland Oregon')
+NON_UK_PLACE = re.compile(r"\b(meath|westmeath|dublin|cork|galway|limerick|wexford|wicklow|kildare|louth|donegal|mayo|"
+                          r"sligo|tipperary|waterford|kilkenny|offaly|laois|carlow|longford|cavan|monaghan|roscommon|"
+                          r"leitrim|republic of ireland|oregon|portland,? (or|oregon|maine)|seattle|chicago|boston,? ma|"
+                          r"philadelphia|florida|arizona|colorado|michigan|virginia|carolina|minnesota|wisconsin|"
+                          r"pennsylvania|massachusetts|new jersey|toronto|ontario|vancouver|quebec|montreal|sydney|"
+                          r"melbourne|brisbane|perth,? (wa|western australia)|auckland|wellington,? nz|dominican|"
+                          r"\bdr\b(?=\W*🇩🇴))\b", re.I)
+_UK_FLAG = "🇬🇧"
+# '<Town> United fan' says nothing about where someone lives
+_CLUB = re.compile(r"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)?\s+((united|utd|fc|afc|rovers|rhinos|wanderers|athletic|albion|"
+                   r"hotspur|celtic|rangers|city fc)\b(\s+(fan|fanatic|supporter|season ticket holder)s?)?|"
+                   r"(fan|fanatic|supporter|season ticket holder)s?\b)", re.I)
+
+
+def abroad_signal(text: str) -> bool:
+    t = text or ""
+    lives_flag = re.search(r"(live|living|based|reside|residing) in\W{0,3}([🇦-🇿]{2})", t)
+    if lives_flag and lives_flag.group(2) != _UK_FLAG:
+        return True
+    return bool(NON_UK_PLACE.search(t))
+
+
 # Mastodon servers for one city/area: an account there with no stated town is taken to be from that area
 SERVER_TOWN = {"mcr.wtf": "Manchester", "glasgow.social": "Glasgow", "newforest.social": "New Forest",
                "mastodon.iow.social": "Isle of Wight"}
@@ -182,9 +206,19 @@ class _BioProvider:
                 continue
             self.stats["job_matches"] += 1
             loc = (p.get("location") or "").strip()
-            area = find_place(loc, pterms) or find_place(text, pterms)
+            # where they live comes from their location field and bio - never from words in their display name
+            # ('Guthrie Glasgow'), except a title-style tail ('Jo Smith | Nurse | Leeds'); football clubs don't count
+            name_parts = re.split(r"\s*[|•·,(/\-–—:]\s*", p.get("name") or "")
+            bio_place = _CLUB.sub(" ", _URL.sub(" ", " \n".join([" ".join(name_parts[1:]), p.get("bio") or ""])))
+            area = find_place(_CLUB.sub(" ", loc), pterms)
+            from_bio = False
+            if not area:
+                area = find_place(bio_place, pterms)
+                from_bio = bool(area)
             if looks_non_uk(loc or text) and not re.search(r"\b(uk|united kingdom|england|scotland|wales)\b", text, re.I):
                 continue
+            if abroad_signal(loc) or (not (area and not from_bio) and abroad_signal(p.get("bio") or "")):
+                continue   # an explicit non-UK home (Meath, Portland Oregon, 'I live in 🇩🇴') beats a UK word in the bio
             dist = None
             uk_only = False
             if not area and p.get("home_town"):

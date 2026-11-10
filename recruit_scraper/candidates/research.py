@@ -130,6 +130,12 @@ class EuropePMCProvider:
             self.notes.append(f"Europe PMC only covers healthcare research; skipped for '{title}'.")
             return
         matcher = RoleMatcher(title, keywords)
+        if matcher.contract:
+            # 'locum nurse' would search every paper about nurses: research says nothing about locum/bank work
+            self.notes.append(f"Europe PMC skipped for '{title}': research articles can't show who works "
+                              f"{'locum / bank / agency' if matcher.contract == 'temporary' else 'permanent'} shifts, "
+                              f"and a plain '{matcher.core}' search would flood the results with academics.")
+            return
         towns = area_towns(place)
         query = build_query(matcher, towns, self.years)
         progress(f"Europe PMC: recent research on '{matcher.core}' with authors in {', '.join(towns)}…")

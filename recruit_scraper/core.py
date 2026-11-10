@@ -5,6 +5,7 @@ import logging
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import zip_longest
 from typing import Callable, Optional
@@ -52,11 +53,53 @@ _UK_PLACES = re.compile(r"\b(uk|united kingdom|england|scotland|wales|london|man
                         r"reading|brighton|leicester|southampton|milton keynes|york|bath|coventry)\b", re.I)
 
 
+_ROLE_NOUN = re.compile(r"(er|or|ist|ant|ian|nurse|chef|cook|lawyer|clerk|officer|manager|lead|head|carer|worker|"
+                        r"assistant|agent|nanny|midwife|surgeon|dentist|vet|gp|staff|crew)s?$")
+
+
+@lru_cache(maxsize=256)
+def _keyword_rule(keyword: str):
+    """(role matcher or None, whole-phrase regex) for one search keyword."""
+    from .candidates.matching import RoleMatcher, _phrase_re   # lazy: candidates imports core helpers
+    k = re.sub(r"\s+", " ", keyword.strip().lower())
+    rm = RoleMatcher(k)
+    role = bool(rm.synonyms or rm.related or rm.contract or _ROLE_NOUN.search(rm.core))
+    return (rm if role else None), _phrase_re(k)
+
+
+def keyword_hit(job: Job, keyword: str) -> bool:
+    """A job title keyword ('care worker', 'locum nurse') must be in the job's TITLE as the whole phrase or a known
+    synonym ('carer', 'support worker'); single words from it anywhere in the ad ('care' + 'worker') don't count.
+    Skill keywords ('python', 'machine learning') match as whole words anywhere in the ad."""
+    from .candidates.matching import CONTRACT_TEMP, _not_the_job
+    rm, phrase = _keyword_rule(keyword)
+    hay = f"{job.title}\n{job.company}\n{job.description}"
+    if rm is None:
+        return bool(phrase.search(hay.lower()))
+    title = re.sub(r"\s+", " ", (job.title or "").lower())
+    hit = None
+    if rm._exact is not None and rm._exact.search(title):
+        hit = f"profile says '{rm.core}'"
+    else:
+        hit = next((f"profile says '{s}'" for s, rx, sc in rm._syn if sc >= 2 and rx.search(title)), None)
+    if hit is None and rm.related:
+        # 'family lawyer' ~ 'Family Solicitor': a related title counts only with the rest of the phrase ('family')
+        from .candidates.matching import SYNONYMS
+        keys = [k for k in SYNONYMS if k != rm.core and re.search(rf"\b{re.escape(k)}\b", rm.core)]
+        rest = [w for w in rm.content_words if not any(w in k.split() for k in keys)]
+        if rest and all(re.search(rf"\b{re.escape(w)}", title) for w in rest):
+            hit = next((f"profile says '{s}'" for s, rx, sc in rm._syn if sc < 2 and rx.search(title)), None)
+    if hit is None or _not_the_job(title, hit):
+        return False
+    if rm.contract == "temporary" and not CONTRACT_TEMP.search(f"{hay}\n{job.employment_type or ''}".lower()):
+        return False      # 'locum nurse': the ad has to say locum / bank / agency / temporary somewhere
+    return True
+
+
 def matches(job: Job, keywords: list[str], locations: list[str], remote_uk: bool = False) -> bool:
     if keywords:
-        hay = f"{job.title}\n{job.company}\n{job.description}".lower()
-        # each keyword is OR'ed; the words within one keyword must all appear
-        if not any(all(w in hay for w in k.lower().split()) for k in keywords):
+        # each keyword is OR'ed
+        if not any(keyword_hit(job, k) for k in keywords if k and k.strip()):
             return False
     if locations:
         loc = (job.location or "").lower()

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Callable, Iterator, Optional
 from urllib.parse import urlparse
 
@@ -60,6 +61,37 @@ OSM_TAGS: dict[str, list[tuple[str, str]]] = {
     "dentist": [("amenity", "dentist")], "vet": [("amenity", "veterinary")],
 }
 OVERPASS = ("https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter")
+OVERPASS_BUDGET = 60.0       # seconds for all Overpass servers together, so a busy server can't stall a search
+OVERPASS_COOLDOWN = 600.0    # after every server failed, skip Overpass for 10 minutes instead of waiting again
+_overpass_down_until = 0.0
+
+
+def overpass_http() -> HttpClient:
+    """Short timeout, one retry: Overpass either answers quickly or is overloaded."""
+    return HttpClient(min_interval=2.0, timeout=25, retries=1, backoff=2)
+
+
+def overpass_elements(http: HttpClient, q: str, budget: float = OVERPASS_BUDGET) -> list[dict]:
+    """Ask each Overpass server in turn within one overall time budget; raise OverpassUnavailable if none answer."""
+    global _overpass_down_until
+    now = time.monotonic()
+    if now < _overpass_down_until:
+        raise OverpassUnavailable("skipped - the servers didn't answer a few minutes ago")
+    start, last = now, None
+    for url in OVERPASS:
+        if time.monotonic() - start > budget:
+            break
+        try:
+            return http.get_json(url, params={"data": q}).get("elements") or []
+        except (requests.RequestException, ValueError) as e:
+            last = e
+            log.info("overpass %s failed: %s", url, e)
+    _overpass_down_until = time.monotonic() + OVERPASS_COOLDOWN
+    raise OverpassUnavailable(type(last).__name__ if last else f"no answer within {budget:.0f}s")
+
+
+class OverpassUnavailable(RuntimeError):
+    pass
 
 
 def osm_tags_for(matcher: RoleMatcher) -> list[tuple[str, str]]:
@@ -77,7 +109,7 @@ class OpenStreetMapProvider:
 
     def __init__(self, http: Optional[HttpClient] = None, fetch_websites: bool = True, max_sites: int = 25,
                  site_http: Optional[HttpClient] = None):
-        self.http = http or HttpClient(min_interval=2.0, timeout=60, retries=3, backoff=3)
+        self.http = http or overpass_http()
         self.fetch_websites = fetch_websites
         self.max_sites = max_sites
         self.site_http = site_http
@@ -88,24 +120,20 @@ class OpenStreetMapProvider:
     def query(self, tags: list[tuple[str, str]], place: Place, radius_miles: float) -> str:
         r = int(min(max(radius_miles, 1), 25) * 1609.344)
         parts = "".join(f'nwr["{k}"="{v}"](around:{r},{place.lat:.5f},{place.lon:.5f});' for k, v in tags)
-        return f"[out:json][timeout:80];({parts});out center tags 400;"
+        return f"[out:json][timeout:25];({parts});out center tags 400;"
 
     def _run(self, q: str) -> list[dict]:
         hit = self.cache.get(q)
         if hit is not None:
             return hit
-        last: Optional[Exception] = None
-        for url in OVERPASS:
-            try:
-                els = self.http.get_json(url, params={"data": q}).get("elements") or []
-                self.cache.set(q, els)
-                return els
-            except (requests.RequestException, ValueError) as e:
-                last = e
-                log.info("overpass %s failed: %s", url, e)
-        log.info("overpass unavailable: %s", last)
-        raise RuntimeError("OpenStreetMap's free Overpass servers are busy right now - search again in a minute "
-                           "(results are cached for a day once they load)")
+        try:
+            els = overpass_elements(self.http, q)
+        except OverpassUnavailable as e:
+            log.info("overpass unavailable: %s", e)
+            raise RuntimeError(f"OpenStreetMap's free Overpass servers are busy right now ({e}) - the other sources "
+                               "still ran; search again later for business listings (cached for a day once they load)")
+        self.cache.set(q, els)
+        return els
 
     def search(self, title: str, place: Place, radius_miles: float, min_exp, max_exp, keywords: list[str],
                include_unknown_distance: bool, geocoder: PlaceGeocoder,

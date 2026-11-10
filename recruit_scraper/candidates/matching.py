@@ -43,10 +43,12 @@ SYNONYMS: dict[str, list[str]] = {
     "sales executive": ["sales", "account executive", "business development", "sales consultant"],
     "marketing": ["marketer", "digital marketing", "marketing manager", "content marketing", "seo", "social media manager"],
     "recruiter": ["recruitment consultant", "talent acquisition", "recruitment", "headhunter", "talent partner"],
-    "teacher": ["teaching", "educator", "tutor", "lecturer", "teaching assistant", "secondary teacher",
-                "primary teacher"],
+    # not 'lecturer' / 'teaching' on their own: universities and lecturers aren't school teachers
+    "teacher": ["educator", "tutor", "secondary teacher", "primary teacher", "headteacher", "supply teacher",
+                "early career teacher", "nqt", "sendco", "senco"],
     "teaching assistant": ["learning support assistant", "classroom assistant"],
-    "chef": ["cook", "sous chef", "head chef", "pastry chef", "chef de partie", "commis chef"],
+    # a bare 'cook' is too often a surname or a game ('Monte Cook Games'): see _not_the_job
+    "chef": ["cook", "head cook", "line cook", "prep cook", "school cook", "breakfast cook", "professional cook", "sous chef", "head chef", "pastry chef", "chef de partie", "commis chef"],
     "driver": ["hgv driver", "lgv driver", "delivery driver", "van driver", "courier", "class 1 driver",
                "class 2 driver"],
     "receptionist": ["front of house", "reception", "front desk"],
@@ -55,10 +57,10 @@ SYNONYMS: dict[str, list[str]] = {
     "cleaner": ["cleaning", "housekeeper", "housekeeping", "domestic cleaner"],
     "hairdresser": ["hair stylist", "stylist", "barber", "hairstylist"],
     "lawyer": ["solicitor", "barrister", "paralegal", "legal counsel", "attorney", "legal executive", "cilex",
-               "conveyancer", "in-house counsel", "trainee solicitor", "associate solicitor", "advocate"],
+               "conveyancer", "in-house counsel", "trainee solicitor", "associate solicitor", "solicitor advocate"],
     "solicitor": ["lawyer", "trainee solicitor", "associate solicitor", "partner solicitor", "legal counsel",
                   "solicitor advocate"],
-    "barrister": ["counsel", "kc", "qc", "pupil barrister", "advocate", "called to the bar"],
+    "barrister": ["counsel", "kc", "qc", "pupil barrister", "faculty of advocates", "called to the bar"],
     "paralegal": ["legal assistant", "legal executive", "cilex", "trainee legal executive"],
     "legal executive": ["cilex", "chartered legal executive", "paralegal"],
     "conveyancer": ["conveyancing", "licensed conveyancer", "property lawyer", "residential property solicitor"],
@@ -177,19 +179,20 @@ class RoleMatcher:
         if self.kw and not any(all(w in text for w in k.split()) for k in self.kw):
             return Match(0, "")
         hit = None
-        if self._exact is not None and (mm := self._exact.search(text)):
-            hit = (3.0, f"profile says '{self.core}'", mm.start())
-        else:
-            for s, rx, sc in self._syn:
-                if mm := rx.search(text):
-                    hit = (sc, f"profile says '{s}'", mm.start())
-                    break
+        # the first phrase that really is the job wins: 'Unpaid carer, support worker' -> 'support worker'
+        cands = ([(3.0, self.core, self._exact)] if self._exact is not None else []) + [(sc, s, rx) for s, rx, sc in self._syn]
+        for sc, s, rx in cands:
+            if (mm := rx.search(text)) and not _not_the_job(text, f"profile says '{s}'"):
+                hit = (sc, f"profile says '{s}'", mm.start())
+                break
         if hit is None:
             if len(self.content_words) >= 2 and all(rx.search(text) for rx in self._words):
                 hit = (1.5, "profile mentions " + " + ".join(f"'{w}'" for w in self.content_words), -1)
             else:
                 return Match()
         score, reason, pos = hit
+        if pos < 0 and _not_the_job(text, reason):
+            return Match()
         ctx = text[max(0, pos - 45):pos] if pos >= 0 else ""
         fm = _FORMER.search(ctx)
         if fm and not re.search(r"\b(now|currently|today)\b", ctx[fm.start():]):
@@ -197,6 +200,43 @@ class RoleMatcher:
         if _ORG.search(text) and not _PERSON.search(text):
             score, reason = score - 0.5, reason + " (looks like a business/organisation account)"
         return Match(score, reason)
+
+
+_PAID_CARER = re.compile(r"\b(professional|paid|senior|home|domiciliary|live[- ]in|night|care home|agency|bank|relief|"
+                         r"lead|nhs|community|private|personal|registered)\s+(carer|caregiver)s?\b|\b(carer|caregiver)s?"
+                         r"\s+(at|in|with|for)\s+(a|an|the)\s+\w*\s*(care|home|agency|company|hospital|service|charity)|"
+                         r"\b(work|working|works|job|employed)\s+(as\s+)?(an?\s+)?(carer|caregiver)\b|"
+                         r"^\W*(carer|caregiver)\W*$", re.I)
+# 'carer' that means looking after family, not a care job
+_UNPAID = re.compile(r"\b(full[- ]?time|unpaid|family|parent|young|informal|primary|sole|24/7|live[- ]in family)\s+"
+                     r"(carer|caregiver|care giver)s?\b|\b(carer|caregiver|care giver)s?\s+(for|to|of)\s+(my|her|his|"
+                     r"their|our|a family|mum|mom|dad|mother|father|son|daughter|wife|husband|partner|parents?|"
+                     r"step|disabled|autistic|elderly)|\b(mum|mom|dad|mother|father|wife|husband|parent|gran|nan|"
+                     r"grandparent|daughter|son)\b\W{1,3}(and\s+|&\s*)?(carer|caregiver)\b|\bmy\s+(carer|caregiver)\b",
+                     re.I)
+# words that mean something else in another language ('chef de service' = head of department in French)
+_FALSE_FRIEND = {"chef": re.compile(r"\bchef(fe)?\s*(\(fe\))?\s*(d['’]une?|de (service|projet|file|clinique|bureau|"
+                                     r"cabinet|l['’]|la |équipe|equipe|mission|produit))", re.I)}
+
+
+_ANIMAL = re.compile(r"\b(veterinary|vet|animal|pet|equine|zoo)\s+(health\s*)?(care\s+assistant|care\s+worker|carer|"
+                     r"nurse|nursing|care)\b", re.I)
+
+
+def _not_the_job(text: str, reason: str) -> bool:
+    term = (re.search(r"'([^']+)'", reason or "") or [None, ""])[1].lower()
+    if term in ("carer", "caregiver", "care giver", "home carer") and _UNPAID.search(text):
+        return True
+    if term in ("carer", "caregiver") and not _PAID_CARER.search(text):
+        return True       # a bare 'carer' in a bio is nearly always family / unpaid / foster care, not a care job
+    if term == "cook" and not re.search(r"^\W*cook\W*$|\b(a|as|the|head|line|prep|school|pastry|breakfast|"
+                                        r"professional|trainee|commis|private)\s+cook\b|\bcook\s+(at|in|for)\b",
+                                        text, re.I):
+        return True
+    if term and _ANIMAL.search(text) and not _phrase_re(term).search(_ANIMAL.sub(" ", text)):
+        return True       # 'Veterinary Care Assistant', 'vet nurse': animal care, not a health / social care job
+    rx = _FALSE_FRIEND.get(term.split()[-1] if term else "")
+    return bool(rx and rx.search(text) and not re.search(r"\bchef de (partie|cuisine|rang)\b", text, re.I))
 
 
 _FORMER = re.compile(r"\b(retired|former(ly)?|ex|failed|recovering|recovered|used to be|one-?time|previous life|past life)\b[\s\-,]*([\w/&\-]+[\s,]+){0,3}$",
@@ -209,7 +249,12 @@ _PERSON = re.compile(r"\b(i|i'm|im|my|me|he/him|she/her|they/them)\b", re.I)
 _BIZ_NAME = re.compile(r"\b(ltd|limited|llp|plc|cic|inc|services|solutions|group|agency|associates|partners|& co|"
                        r"electricians|plumbers|accountants|solicitors|builders|roofers|carers|recruitment|consultancy|"
                        r"news|journal|magazine|podcast|official|council|charity|association|society|network|"
-                       r"foundation|trust|union|federation|institute|uk)\b", re.I)
+                       r"foundation|trust|union|federation|institute|uk|university|college|hospital|hospice|library|"
+                       r"museum)\b", re.I)
+# bios of publications / institutions written in the third person ('Practice Nurse journal is designed to…')
+_INST_BIO = re.compile(r"^\W*(the\s+)?[\w\s&'’-]{0,60}\b(journal|magazine|publication|newsletter|podcast|university|"
+                       r"college|institution|organisation|organization)\b[^.]{0,40}\b(is|are|publishes|provides)\b|\b(one of the uk'?s|official account|posting weekdays|is designed to|"
+                       r"peer[- ]reviewed)\b", re.I)
 _BIZ_BIO = re.compile(r"\b(provides?|delivers?|offering|we('re| are| provide| offer| help| support)|our (team|services|"
                       r"clients|firm|practice|members)|(is|are) an? (independent|leading|award[- ]winning|professional|"
                       r"chartered|family[- ]run|local|trusted|uk)[\w\s,&-]{0,40}(firm|company|practice|business|charity|"
@@ -225,6 +270,9 @@ def looks_like_business(name: str, bio: str) -> bool:
     if _BIZ_NAME.search(name or ""):
         return True
     b = bio or ""
+    if (_INST_BIO.search(b) and not re.search(r"\b(i'm|i am|i've|my)\b", b, re.I)
+            and not re.search(r"\b(at|in|from|with)\s+(the\s+)?(uni|university|college|journal)\b", b, re.I)):
+        return True
     return bool(_BIZ_BIO.search(b)) and not re.search(r"\b(i'm|i am|i've|my|me)\b|\b(he|she|they)/(him|her|them)\b",
                                                       b, re.I)
 

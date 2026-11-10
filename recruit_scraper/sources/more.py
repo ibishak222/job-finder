@@ -23,6 +23,19 @@ from ..salary import find_salary_in_text
 from ..utils import detect_remote, find_email, html_to_text, normalise_employment_type, to_iso_date
 from .base import Source
 
+# Himalayas' 'country' filter only takes a country: a town or postcode ('Glasgow', 'M1 1AE') gets HTTP 400
+_COUNTRIES = ("united states", "usa", "canada", "ireland", "germany", "france", "spain", "italy", "netherlands",
+              "portugal", "poland", "sweden", "denmark", "norway", "finland", "belgium", "switzerland", "austria",
+              "australia", "new zealand", "india", "singapore", "south africa", "brazil", "mexico", "japan")
+
+
+def himalayas_country(location: str) -> str:
+    """A country name for Himalayas: a named country passes through; any UK town, region or postcode -> UK."""
+    loc = (location or "").strip().lower()
+    if loc in _COUNTRIES:
+        return "United States" if loc == "usa" else location.strip().title()
+    return "United Kingdom"     # this is a UK job finder: towns, counties and postcodes are UK places
+
 log = logging.getLogger(__name__)
 
 
@@ -154,7 +167,7 @@ class HimalayasSource(Source):
             if self.keyword:
                 url, params = "https://himalayas.app/jobs/api/search", {"q": self.keyword, "page": page + 1}
                 if self.location:
-                    params["country"] = "United Kingdom" if self.location.lower() in ("uk", "london", "england") else self.location
+                    params["country"] = himalayas_country(self.location)
             else:
                 url, params = "https://himalayas.app/jobs/api", {"limit": 20}
                 if cursor:
