@@ -24,6 +24,8 @@ class Candidate:
     phone: str = ""               # only if the person/company published it themselves
     contact_source: str = ""      # URL of the page (or profile) where the email/phone was published
     profile_url: str = ""
+    message_url: str = ""         # people without an email: their Bluesky/Mastodon profile, to message them there (manual)
+    message_via: str = ""         # "Bluesky" | "Mastodon"
     website: str = ""
     linkedin_url: str = ""        # link only - never fetched
     twitter_url: str = ""

@@ -18,10 +18,13 @@ from .providers import GitHubProvider, JobAdContactsProvider, ProviderStop
 from .directories import OpenStreetMapProvider, TeamPageProvider
 from .matching import RoleMatcher
 from .social import BlueskyProvider, MastodonProvider
+from .research import RESEARCH_NOTE, EuropePMCProvider, is_health_role
+from .employers import EmployerLead, EmployerLeadsFinder, employer_kinds
 
 PEOPLE_SOURCES = ("github", "bluesky", "mastodon", "openstreetmap")
 SOURCE_LABELS = {"contacts": "Contact check (links on their profiles)", "github": "GitHub", "bluesky": "Bluesky", "mastodon": "Mastodon", "job_ads": "Hiring contacts",
-                 "openstreetmap": "OpenStreetMap businesses", "team_pages": "Team pages"}
+                 "openstreetmap": "OpenStreetMap businesses", "team_pages": "Team pages",
+                 "europepmc": "Clinical researchers (Europe PMC)", "employers": "Employers to contact (NHS ODS + OpenStreetMap)"}
 CONTRACT_CHOICES = {"any": "Any", "permanent": "Permanent", "temporary": "Locum / temp / contract"}
 
 log = logging.getLogger(__name__)
@@ -46,6 +49,35 @@ class CandidateResult:
     tech_role: bool = True
     coverage: str = ""   # friendly note when public sources cover this kind of job poorly
     contact_summary: str = ""  # e.g. "5 of 40 people published an email…"
+    research_note: str = ""    # shown when Europe PMC research contacts are in the results
+    employers: list[EmployerLead] = field(default_factory=list)   # organisations to contact - NOT candidates
+    employers_note: str = ""
+
+
+def _is_bluesky(u: str) -> bool:
+    return "bsky.app/profile/" in (u or "")
+
+
+def _is_mastodon(u: str) -> bool:
+    u = u or ""
+    return (bool(re.match(r"https?://[^/]+/(@[\w.\-]+(@[\w.\-]+)?|users/[\w.\-]+)/?$", u))
+            and "bsky.app" not in u and "github.com" not in u)
+
+
+def add_message_links(cands: list[Candidate]) -> int:
+    """Everyone without an email gets a link to their own Bluesky/Mastodon profile to message them there by hand
+    (nothing is sent automatically). Returns how many people got one."""
+    n = 0
+    for c in cands:
+        c.message_url, c.message_via = "", ""
+        if c.kind != "candidate" or c.email:
+            continue
+        links = [c.profile_url] + (c.other_profiles or "").split()
+        url = next((u for u in links if _is_bluesky(u)), "") or next((u for u in links if _is_mastodon(u)), "")
+        if url:
+            c.message_url, c.message_via = url, "Bluesky" if _is_bluesky(url) else "Mastodon"
+            n += 1
+    return n
 
 
 def _norm_link(u: str) -> str:
@@ -62,7 +94,9 @@ def merge_duplicates(cands: list[Candidate]) -> list[Candidate]:
 
     def keys(c: Candidate) -> list[str]:
         ks = [f"e:{c.email.lower()}"] if c.email else []
-        ks += [f"l:{_norm_link(u)}" for u in [c.profile_url, c.website] + (c.other_profiles or "").split() if u]
+        # a Europe PMC row's link is the ARTICLE, shared by its co-authors - never a person key
+        own = [] if c.provider == "europepmc" else [c.profile_url]
+        ks += [f"l:{_norm_link(u)}" for u in own + [c.website] + (c.other_profiles or "").split() if u]
         return ks
 
     for c in sorted(cands, key=lambda c: -(c.match_score or 0)):
@@ -260,7 +294,7 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
                     max_wait_minutes: float = 0, max_results: int = 1000, all_presets: bool = False,
                     company_pages: bool = True, team_urls: list[str] = (), contract: str = "any",
                     uk_unknown: bool = True, enrich_top: int = 60, enrich_seconds: float = 120,
-                    decode_obfuscated: bool = True,
+                    decode_obfuscated: bool = True, europepmc: bool = False, employers: bool = True,
                     progress: Callable[[str], None] = lambda m: None, cancel=None) -> CandidateResult:
     if cancel is not None:  # stop at the next progress message once the user presses Cancel
         _report = progress
@@ -296,6 +330,8 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
         people.append(OpenStreetMapProvider(fetch_websites=fetch_websites))
     if ("team_pages" in providers or team_urls) and not hireable_only and team_urls:
         people.append(TeamPageProvider(list(team_urls)))
+    if (europepmc or "europepmc" in providers) and not hireable_only:
+        people.append(EuropePMCProvider())
     for prov in people:
         rep = ProviderReport(prov.name, "ok")
         try:
@@ -312,12 +348,15 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
         except Exception as e:  # noqa: BLE001
             log.exception("%s provider failed", prov.name)
             rep.status, rep.message = "error", f"{SOURCE_LABELS.get(prov.name, prov.name)} search failed: {e}"
+            if prov.name == "europepmc" and "search failed" in str(e):
+                rep.message = str(e)
         if prov.notes:
             rep.message = "; ".join(dict.fromkeys(filter(None, [rep.message] + prov.notes)))
         rep.stats = prov.stats
         if not rep.found and rep.status == "ok" and (prov.name == "github" and not tech or
                                                      prov.name == "openstreetmap" and any("No OpenStreetMap business category"
-                                                                                          in n for n in prov.notes)):
+                                                                                          in n for n in prov.notes) or
+                                                     prov.name == "europepmc" and not is_health_role(title)):
             rep.status = "skipped"
         result.reports.append(rep)
 
@@ -378,14 +417,18 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
         for c in uniq:
             score_fit(c, radius_miles, min_exp, max_exp, want)
         uniq.sort(key=lambda c: rank_key(c, min_exp, max_exp, want))
+    n_msg = add_message_links(uniq)
+    if any(c.provider.split(" + ")[0] == "europepmc" or "europepmc" in c.provider for c in uniq):
+        result.research_note = RESEARCH_NOTE
     people_rows = [c for c in uniq if c.kind == "candidate"]
     if people_rows:
         n_e = sum(1 for c in people_rows if c.email)
         n_p = sum(1 for c in people_rows if c.phone)
         result.contact_summary = (f"{n_e} of {len(people_rows)} people published an email"
                                   + (f" and {n_p} a phone number" if n_p else "")
-                                  + " (source page shown for each). The rest can be messaged through their "
-                                    "profile link.")
+                                  + " (source page shown for each)."
+                                  + (f" {n_msg} more can be messaged on Bluesky/Mastodon ('Message' link)." if n_msg
+                                     else " The rest can be messaged through their profile link."))
     n_people = sum(1 for c in uniq if c.kind == "candidate")
     n_uk = sum(1 for c in uniq if c.kind == "candidate" and "no nearby town" in (c.location or ""))
     n_biz = sum(1 for c in uniq if c.kind == "business")
@@ -405,6 +448,27 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
         result.coverage = (f"Nobody near {place.town} mentions '{title}' in a public profile. Try a broader title "
                            "(e.g. 'developer'), a bigger radius, or fewer years of experience.")
     result.candidates = uniq
+    if employers and employer_kinds(title):
+        finder = EmployerLeadsFinder()
+        rep = ProviderReport("employers", "ok")
+        try:
+            result.employers, n = finder.find(title, place, radius_miles, entries, progress)
+            result.suppressed += n
+            rep.found = len(result.employers)
+        except SearchCancelled:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("employer leads failed")
+            rep.status, rep.message = "error", str(e)
+        if finder.notes:
+            rep.message = "; ".join(filter(None, [rep.message] + finder.notes))
+        rep.stats = finder.stats
+        result.reports.append(rep)
+        if result.employers:
+            kinds = ", ".join(dict.fromkeys(l.employer_type for l in result.employers))
+            result.employers_note = (f"{len(result.employers)} employers near {place.town} that hire this kind of "
+                                     f"worker ({kinds}) - organisations to approach, not candidates. Business "
+                                     "contact details from NHS ODS and OpenStreetMap.")
     return result
 
 
@@ -419,6 +483,23 @@ def purge_old_exports(days: int, folder: Path = EXPORT_DIR) -> int:
             f.unlink()
             n += 1
     return n
+
+
+def export_employers(leads: list[EmployerLead], base: Path) -> Optional[Path]:
+    """Employers to contact (organisations, not candidates) as a CSV next to the people export."""
+    import csv
+    if not leads:
+        return None
+    p = base.with_name(base.name + "_employers").with_suffix(".csv")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    cols = [c for c in EmployerLead.field_names() if c not in ("lat", "lon")]
+    with p.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for l in leads:
+            w.writerow({k: "" if v is None else v for k, v in l.to_dict().items()})
+    p.chmod(0o600)
+    return p
 
 
 def export(cands: list[Candidate], base: Path, fmt: str = "both") -> list[Path]:

@@ -8,7 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .engine import EXPORT_DIR, export, find_candidates, purge_old_exports
+from .engine import EXPORT_DIR, export, export_employers, find_candidates, purge_old_exports
 from .geo import PostcodeError
 
 
@@ -45,6 +45,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--enrich-seconds", type=float, default=120, help="time limit for that contact check")
     p.add_argument("--no-obfuscated", action="store_true",
                    help="don't decode addresses written as 'name [at] domain [dot] com'")
+    p.add_argument("--europepmc", action="store_true",
+                   help="healthcare jobs: also list clinical researchers near the postcode who published a "
+                        "correspondence email in their own author affiliation in recent Europe PMC articles (off by "
+                        "default; research contacts - PECR/consent applies before emailing them)")
+    p.add_argument("--no-employers", action="store_true",
+                   help="healthcare/care jobs: don't list employers to contact (GP practices, care homes …) from "
+                        "NHS ODS and OpenStreetMap")
     p.add_argument("--near-only", action="store_true",
                    help="leave out UK-based Bluesky/Mastodon people who don't name a town near the postcode")
     p.add_argument("--no-websites", action="store_true",
@@ -87,7 +94,8 @@ def main(argv=None) -> int:
                               include_unknown_distance=a.include_unknown_distance, job_sources=a.job_sources,
                               companies=a.companies, team_urls=a.team_url, contract=a.contract, uk_unknown=not a.near_only,
                               enrich_top=0 if a.no_websites else a.enrich_top, enrich_seconds=a.enrich_seconds,
-                              decode_obfuscated=not a.no_obfuscated, progress=lambda m: print("  " + m, file=sys.stderr))
+                              decode_obfuscated=not a.no_obfuscated, europepmc=a.europepmc,
+                              employers=not a.no_employers, progress=lambda m: print("  " + m, file=sys.stderr))
     except PostcodeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -95,6 +103,9 @@ def main(argv=None) -> int:
     if base.suffix in (".csv", ".json"):
         base = base.with_suffix("")
     files = export(res.candidates, base, a.format)
+    emp = export_employers(res.employers, base)
+    if emp:
+        files.append(emp)
     print("\nSummary", file=sys.stderr)
     for r in res.reports:
         print(f"  {r.name:8s} {r.status}: {r.found} found" + (f" ({r.message})" if r.message else ""), file=sys.stderr)
@@ -104,6 +115,10 @@ def main(argv=None) -> int:
         print(f"  note: {res.coverage}", file=sys.stderr)
     if res.contact_summary:
         print(f"  contacts: {res.contact_summary}", file=sys.stderr)
+    if res.research_note:
+        print(f"  note: {res.research_note}", file=sys.stderr)
+    if res.employers_note:
+        print(f"  employers: {res.employers_note}", file=sys.stderr)
     if res.suppressed:
         print(f"  removed {res.suppressed} on the do-not-contact list", file=sys.stderr)
     print(f"{len(res.candidates)} records ({sum(1 for c in res.candidates if c.email)} with email). "
