@@ -29,10 +29,16 @@ GDPR_TEXT = """
   prefer people who marked themselves **Available for hire**.
 * **Bluesky / Mastodon:** only public profiles whose own bio mentions the job and a nearby place. People are found
   through profile search, profession starter packs and custom feeds (Bluesky), and profile search on several UK and
-  general servers plus the job's hashtag (Mastodon), but in every case their **own bio** must match. Emails are never
-  lifted from bios; Mastodon results only include people who opted in to being discoverable, and Bluesky people who
-  hid their profile from logged-out visitors are skipped. A Bluesky handle that is the person's own domain
-  (e.g. *janesmith.co.uk*) counts as their website. Contact them through their profile or their own website.
+  general servers plus the job's hashtag (Mastodon), but in every case their **own bio** must match. Mastodon results
+  only include people who opted in to being discoverable, and Bluesky people who hid their profile from logged-out
+  visitors are skipped. A Bluesky handle that is the person's own domain (e.g. *janesmith.co.uk*) counts as their
+  website.
+* **Contact details** are only ones the person **published themselves**: written in their own bio / profile fields,
+  or on a page linked from their profile (their website, a link-in-bio page, or that site's contact/about page).
+  Nothing is guessed. Addresses written as *name [at] domain [dot] com* are decoded the way a reader would (you can
+  switch this off). Generic firm addresses (info@, enquiries@…) on an employer's site are listed as **businesses**,
+  not as the person's email. The **Contact source** column records the page for every contact - keep it so you can
+  tell people where you got their details. Everyone else: message them through their profile.
 * **OpenStreetMap businesses** are firms and sole traders mapped by volunteers with the contact details published
   for the business (© OpenStreetMap contributors, ODbL). They are **businesses, not job seekers**; a sole trader's
   details are still personal data.
@@ -54,6 +60,7 @@ def _frame(rows: list[dict]) -> pd.DataFrame:
         (f"{y:g} yrs (estimated)" if "estimated" in (src or "") else f"{y:g} yrs") if pd.notna(y) else ""
         for y, src in zip(df["experience_years"], df["experience_source"])]
     for c in ("name", "headline", "company", "location", "email", "email_source", "website", "phone", "provider",
+              "contact_source",
               "match_reason", "other_profiles", "contract", "fit_reason", "last_active",
               "linkedin_url", "twitter_url"):
         df[c] = df[c].fillna("")
@@ -64,6 +71,7 @@ EXPORT_COLUMNS = {
     "name": "Name", "kind": "Type", "headline": "Headline / bio", "company": "Company", "location": "Location",
     "distance_miles": "Miles away", "experience_years": "Experience (years)", "experience_source": "Experience source",
     "hireable": "Available for hire", "email": "Email", "email_source": "Email source", "phone": "Phone",
+    "contact_source": "Contact source (page)",
     "profile_url": "Profile / ad link", "website": "Website", "linkedin_url": "LinkedIn", "twitter_url": "X / Twitter",
     "fit": "Best-match score", "fit_reason": "Score breakdown", "last_active": "Last active",
     "contract": "Contract (from profile)", "provider": "Found via", "match_reason": "Why they match", "other_profiles": "Other profiles",
@@ -81,6 +89,8 @@ NOTICE_LINES = [
     "- OpenStreetMap: business / sole-trader listings (© OpenStreetMap contributors, ODbL) - businesses, not job seekers.",
     "- Team page: staff details the employer published on its own website.",
     "- 'self-published on personal website <url>': the person published it on their own site (source URL recorded).",
+    "- 'published in their own Bluesky/Mastodon profile' / '... linked from their own profile': the person published it"
+    " in their bio or on a page their profile links to (see 'Contact source (page)').",
     "- 'published by the employer…': business hiring contacts from job ads or company careers/contact pages.",
     "",
     "Before contacting anyone: check the do-not-contact list, follow PECR rules for unsolicited email, and tell them "
@@ -111,7 +121,7 @@ def cand_exports(query: str) -> dict:
     }
 
 CAND_DEFAULTS = {"c_github": True, "c_bsky": True, "c_masto": True, "c_osm": True, "c_team_urls": "",
-                 "c_f_contract": "Any", "c_uk_unknown": True, "c_f_near": False, "c_sites": True, "c_ads": True, "c_ads_presets": True, "c_hireable": False,
+                 "c_f_contract": "Any", "c_uk_unknown": True, "c_enrich_n": 60, "c_obf": True, "c_f_contact": False, "c_f_near": False, "c_sites": True, "c_ads": True, "c_ads_presets": True, "c_hireable": False,
                  "c_unread": True, "c_unknown": False, "c_retention": 30, "c_max_profiles": 200, "c_max_accounts": 600,
                  "c_areas": 6, "c_wait": 0, "c_title": "", "c_postcode": "", "c_radius": 15, "c_exp": (3, 30),
                  "c_keywords": "", "c_f_sort": "Best match", "c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False}
@@ -158,9 +168,17 @@ def candidates_page():
                          height=90, placeholder="https://www.example-law.co.uk/our-people")
             st.caption("Reads the staff details the employer published as schema.org data (robots.txt and noindex "
                        "respected); only people whose job title matches are kept.")
-        st.toggle("Check their own websites for contact details", key="c_sites",
-                  help="If a person links their own website/portfolio, read it politely (robots.txt and "
-                       "noindex respected) and record an email/phone they published there themselves.")
+        st.toggle("Check the links on their profiles for contact details", key="c_sites",
+                  help="Follows the links on each person's own profile (their website, own-domain handle, "
+                       "link-in-bio pages like bio.link / beacons / carrd / about.me, plus one hop to a contact or "
+                       "about page) and records an email/phone THEY published there, with the page it came from. "
+                       "robots.txt and noindex respected; Linktree forbids crawling so it is never read.")
+        st.slider("…for the best-matching people (top N)", 0, 200, step=10, key="c_enrich_n",
+                  help="Contact check runs for this many people without an email, best matches first, within "
+                       "about 2 minutes. 0 = off.")
+        st.toggle("Read emails written as 'name [at] domain [dot] com'", key="c_obf",
+                  help="People often write their address this way so spam bots can't read it. A human reader "
+                       "would, so this decodes it (only on their own pages / bio). Turn off to skip such addresses.")
         st.checkbox("Hiring contacts published by employers", key="c_ads",
                     help="Recruiter/hiring emails employers published in job ads, plus careers@/jobs@ style "
                          "addresses on company careers/contact pages. Business contacts, not candidates.")
@@ -221,7 +239,7 @@ def candidates_page():
                    disabled=running, key="cand_go")
     if b2.button("🧹 Clear results", width="stretch", key="cand_clear",
                  disabled=running or st.session_state.get("cand_results") is None):
-        for k in ("cand_results", "cand_meta", "cand_reports", "cand_task_notice", "cand_coverage"):
+        for k in ("cand_results", "cand_meta", "cand_reports", "cand_task_notice", "cand_coverage", "cand_contacts"):
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -246,7 +264,8 @@ def candidates_page():
                 include_unknown_distance=ss["c_unknown"], include_unread=ss["c_unread"],
                 fetch_websites=ss["c_sites"], max_wait_minutes=float(ss["c_wait"]),
                 max_results=int(ss["c_max_accounts"]), all_presets=ss["c_ads_presets"], team_urls=team_urls,
-                uk_unknown=ss["c_uk_unknown"],
+                uk_unknown=ss["c_uk_unknown"], enrich_top=int(ss["c_enrich_n"]), enrich_seconds=120,
+                decode_obfuscated=ss["c_obf"],
                 job_sources=["remotive", "arbeitnow", "remoteok", "himalayas", "jobicy"],
                 companies=[l.strip() for l in ss.get("companies_text", "").splitlines() if l.strip()])
             radius, retention = float(ss["c_radius"]), int(ss["c_retention"])
@@ -284,9 +303,11 @@ def _apply(t) -> None:
         lines_.append(f"🗑️ Deleted {t.purged} old candidate export(s)")
     st.session_state["cand_reports"] = lines_
     st.session_state["cand_coverage"] = res.coverage
+    st.session_state["cand_contacts"] = getattr(res, "contact_summary", "")
     st.session_state["cand_tech"] = res.tech_role
     st.session_state.update({"c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False,
-                             "c_f_contract": "Any", "c_f_sort": "Best match", "c_f_near": False})
+                             "c_f_contract": "Any", "c_f_sort": "Best match", "c_f_near": False,
+                             "c_f_contact": False})
 
 
 def _results() -> None:
@@ -305,6 +326,8 @@ def _results() -> None:
             st.markdown("  \n".join(st.session_state["cand_reports"]), unsafe_allow_html=True)
     if st.session_state.get("cand_coverage"):
         st.info("ℹ️ " + st.session_state["cand_coverage"])
+    if st.session_state.get("cand_contacts"):
+        st.success("📇 " + st.session_state["cand_contacts"])
     st.warning("🔐 Personal data. Use only with a lawful basis, and don't share these exports.")
     if df.empty:
         st.info("Nobody's public profile matched this job near that postcode. Try a bigger radius, a more common "
@@ -319,6 +342,7 @@ def _results() -> None:
     g1, g2, g4, g3 = st.columns([1, 1, 2, 1])
     hire = g1.toggle("Only 'Available for hire'", key="c_f_hire")
     phone = g2.toggle("Only with phone", key="c_f_phone")
+    has_contact = g2.toggle("Has contact (email or phone)", key="c_f_contact")
     near = g1.toggle("Only near the postcode", key="c_f_near",
                      help="Hide UK people who don't name a town near the postcode")
     contract = g4.radio("Contract type", ["Any", "Permanent", "Locum / temp / contract"], horizontal=True,
@@ -332,7 +356,8 @@ def _results() -> None:
 
     def reset():
         st.session_state.update({"c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False,
-                                 "c_f_contract": "Any", "c_f_sort": "Best match", "c_f_near": False})
+                                 "c_f_contract": "Any", "c_f_sort": "Best match", "c_f_near": False,
+                             "c_f_contact": False})
     g3.button("Reset filters", on_click=reset, key="cand_reset_filters")
 
     view = df
@@ -355,6 +380,8 @@ def _results() -> None:
         view = view[view["hireable"] == "Yes"]
     if phone:
         view = view[view["phone"] != ""]
+    if has_contact:
+        view = view[(view["email"] != "") | (view["phone"] != "")]
     if near:
         view = view[~view["location"].str.contains("no nearby town", regex=False)]
     if sort == "Nearest":
@@ -371,7 +398,8 @@ def _results() -> None:
         m[1].metric("Businesses", int((df["kind"] == "business").sum()),
                     help="Firms / sole traders (OpenStreetMap), not individual job seekers")
         m[2].metric("Hiring contacts", int((df["kind"] == "hiring contact").sum()))
-        m[3].metric("With email", int((df["email"] != "").sum()))
+        m[3].metric("With email", int((df["email"] != "").sum()),
+                    help="Only emails people published themselves (bio, own site, link-in-bio page)")
         m[4].metric("Available for hire", int((df["hireable"] == "Yes").sum()))
     if (df["provider"] == "openstreetmap").any():
         st.caption("Business listings: data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, ODbL.")
@@ -382,7 +410,7 @@ def _results() -> None:
         st.info("No one matches these filters. Press **Reset filters** to see everyone again.")
     else:
         cols = ["name", "fit", "provider", "profile_url", "match_reason", "fit_reason", "email", "phone", "headline", "company", "location",
-                "distance_miles", "experience", "contract", "hireable", "email_source", "website", "other_profiles",
+                "distance_miles", "experience", "contract", "hireable", "contact_source", "email_source", "website", "other_profiles",
                 "linkedin_url", "twitter_url", "last_active", "kind", "found_at"]
         st.dataframe(view[cols], hide_index=True, width="stretch", height=min(560, 38 + 35 * len(view)),
                      key="cand_table", column_config={
@@ -396,6 +424,8 @@ def _results() -> None:
             "experience": st.column_config.TextColumn("Experience", help="GitHub values are estimates from account age"),
             "hireable": "Available for hire",
             "email_source": st.column_config.TextColumn("Email source", width="large"),
+            "contact_source": st.column_config.LinkColumn("Contact source", help="The page where this person "
+                                                          "published the email/phone (keep for UK GDPR)"),
             "website": st.column_config.LinkColumn("Website"), "kind": "Type",
             "provider": st.column_config.TextColumn("Found via", help="Which public source(s) this person came from"),
             "match_reason": st.column_config.TextColumn("Why they match", width="medium"),

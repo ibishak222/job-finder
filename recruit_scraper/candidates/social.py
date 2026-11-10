@@ -27,6 +27,7 @@ from typing import Callable, Iterator, Optional
 from ..http import HttpClient
 from .cache import DiskCache
 from .contacts import SiteContactFinder
+from .enrich import text_contacts
 from .geo import Place, PlaceGeocoder, far_uk_place, haversine_miles, looks_non_uk
 from .matching import RoleMatcher, contract_type, find_place, looks_like_business, place_terms, years_from_text
 from .models import Candidate
@@ -101,8 +102,9 @@ class _BioProvider:
     max_queries = 8
 
     def __init__(self, fetch_websites: bool = True, site_http: Optional[HttpClient] = None,
-                 max_queries: Optional[int] = None, uk_unknown: bool = False):
+                 max_queries: Optional[int] = None, uk_unknown: bool = False, decode_obfuscated: bool = True):
         self.fetch_websites = fetch_websites
+        self.decode_obfuscated = decode_obfuscated
         self.uk_unknown = uk_unknown
         if max_queries is not None:
             self.max_queries = max_queries
@@ -223,26 +225,35 @@ class _BioProvider:
                 match_score=m.score, match_reason=m.reason + (f" (found via {p['via']})" if p.get("via") else ""),
                 contract=contract_type(p.get("bio") or ""), last_active=p.get("last_active") or "",
                 other_profiles=" ".join(u for u in (p.get("links") or []) if u != site)[:500]))
+            # contact details they wrote in their OWN bio / profile fields (plain or 'name [at] domain' style)
+            emails, phones = text_contacts(_URL.sub(" ", p.get("bio") or ""), self.decode_obfuscated)
+            if emails:
+                cands[-1].email, cands[-1].contact_source = emails[0], p["url"]
+                cands[-1].email_source = f"published in their own {self.label} profile {p['url']}"
+                self.stats["bio_emails"] = self.stats.get("bio_emails", 0) + 1
+            if phones:
+                cands[-1].phone = phones[0]
+                cands[-1].contact_source = cands[-1].contact_source or p["url"]
         if self.fetch_websites:
-            with_site = [c for c in cands if c.website]
+            with_site = [c for c in cands if c.website and not c.email]
             if with_site:
                 progress(f"{self.label}: checking {len(with_site)} personal websites for self-published contacts…")
                 sites = SiteContactFinder(self._site_http or HttpClient(min_interval=1.0, timeout=12, retries=1))
                 with ThreadPoolExecutor(max_workers=6) as ex:
                     for c, res in zip(with_site, ex.map(lambda c: sites.personal(c.website), with_site)):
                         self.stats["websites_checked"] += 1
-                        if res["emails"]:
-                            c.email = res["emails"][0]
+                        if res["emails"] and not c.email:
+                            c.email, c.contact_source = res["emails"][0], res["source_url"] or c.website
                             c.email_source = f"self-published on personal website {res['source_url']}"
                             self.stats["website_emails"] += 1
-                        if res["phones"]:
+                        if res["phones"] and not c.phone:
                             c.phone = res["phones"][0]
                         c.linkedin_url = c.linkedin_url or (res["linkedin"] or "")
                         c.twitter_url = c.twitter_url or (res["twitter"] or "")
         for c in cands:
             if not c.email:
                 c.email_source = ("none self-published on their website" if c.website and self.fetch_websites else
-                                  f"not collected from {self.label} bios - contact them via their profile")
+                                  f"none in their {self.label} bio - contact them via their profile")
             yield c
         if people and not cands:
             self.notes.append(f"{len(people)} profiles checked; none both mention the job and an area near "

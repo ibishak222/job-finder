@@ -22,6 +22,7 @@ class Candidate:
     email: str = ""
     email_source: str = ""        # e.g. "published in job ad"
     phone: str = ""               # only if the person/company published it themselves
+    contact_source: str = ""      # URL of the page (or profile) where the email/phone was published
     profile_url: str = ""
     website: str = ""
     linkedin_url: str = ""        # link only - never fetched

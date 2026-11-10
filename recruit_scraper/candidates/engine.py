@@ -20,7 +20,7 @@ from .matching import RoleMatcher
 from .social import BlueskyProvider, MastodonProvider
 
 PEOPLE_SOURCES = ("github", "bluesky", "mastodon", "openstreetmap")
-SOURCE_LABELS = {"github": "GitHub", "bluesky": "Bluesky", "mastodon": "Mastodon", "job_ads": "Hiring contacts",
+SOURCE_LABELS = {"contacts": "Contact check (links on their profiles)", "github": "GitHub", "bluesky": "Bluesky", "mastodon": "Mastodon", "job_ads": "Hiring contacts",
                  "openstreetmap": "OpenStreetMap businesses", "team_pages": "Team pages"}
 CONTRACT_CHOICES = {"any": "Any", "permanent": "Permanent", "temporary": "Locum / temp / contract"}
 
@@ -45,6 +45,7 @@ class CandidateResult:
     suppressed: int = 0
     tech_role: bool = True
     coverage: str = ""   # friendly note when public sources cover this kind of job poorly
+    contact_summary: str = ""  # e.g. "5 of 40 people published an email…"
 
 
 def _norm_link(u: str) -> str:
@@ -93,7 +94,7 @@ def _absorb(hit: Candidate, c: Candidate) -> None:
             links.append(u)
     hit.other_profiles = " ".join(dict.fromkeys(links))
     for f in ("email", "email_source", "phone", "website", "linkedin_url", "twitter_url", "location", "company",
-              "contract"):
+              "contract", "contact_source"):
         if not getattr(hit, f) and getattr(c, f):
             setattr(hit, f, getattr(c, f))
     if hit.distance_miles is None and c.distance_miles is not None:
@@ -258,7 +259,8 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
                     delay: float = 1.0, include_unread: bool = True, fetch_websites: bool = True,
                     max_wait_minutes: float = 0, max_results: int = 1000, all_presets: bool = False,
                     company_pages: bool = True, team_urls: list[str] = (), contract: str = "any",
-                    uk_unknown: bool = True,
+                    uk_unknown: bool = True, enrich_top: int = 60, enrich_seconds: float = 120,
+                    decode_obfuscated: bool = True,
                     progress: Callable[[str], None] = lambda m: None, cancel=None) -> CandidateResult:
     if cancel is not None:  # stop at the next progress message once the user presses Cancel
         _report = progress
@@ -285,9 +287,11 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
                                      include_unread=include_unread, fetch_websites=fetch_websites,
                                      max_wait_minutes=max_wait_minutes))
     if "bluesky" in providers and not hireable_only:
-        people.append(BlueskyProvider(fetch_websites=fetch_websites, uk_unknown=uk_unknown))
+        people.append(BlueskyProvider(fetch_websites=fetch_websites and not enrich_top, uk_unknown=uk_unknown,
+                                      decode_obfuscated=decode_obfuscated))
     if "mastodon" in providers and not hireable_only:
-        people.append(MastodonProvider(fetch_websites=fetch_websites, uk_unknown=uk_unknown))
+        people.append(MastodonProvider(fetch_websites=fetch_websites and not enrich_top, uk_unknown=uk_unknown,
+                                       decode_obfuscated=decode_obfuscated))
     if "openstreetmap" in providers and not hireable_only:
         people.append(OpenStreetMapProvider(fetch_websites=fetch_websites))
     if ("team_pages" in providers or team_urls) and not hireable_only and team_urls:
@@ -348,6 +352,40 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
     for c in uniq:
         score_fit(c, radius_miles, min_exp, max_exp, want)
     uniq.sort(key=lambda c: rank_key(c, min_exp, max_exp, want))
+    if fetch_websites and enrich_top > 0 and any(c.kind == "candidate" for c in uniq):
+        # follow the links on the best-matching people's own profiles for contacts they published themselves
+        from .enrich import enrich_candidates
+        rep = ProviderReport("contacts", "ok")
+        try:
+            extra, rep.stats = enrich_candidates(uniq, enrich_top, enrich_seconds,
+                                                 decode_obfuscated=decode_obfuscated, progress=progress)
+            rep.found = rep.stats.get("emails_found", 0)
+            if rep.stats.get("not_checked_time_limit"):
+                rep.message = f"time limit reached; {rep.stats['not_checked_time_limit']} people not checked"
+        except SearchCancelled:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("contact check failed")
+            extra, rep.status, rep.message = [], "error", str(e)
+        result.reports.append(rep)
+        have = {c.email for c in uniq if c.email}
+        for b in extra:
+            if b.email not in have:
+                have.add(b.email)
+                uniq.append(b)
+        uniq, n = suppression.apply(uniq, entries)   # newly found emails may be on the do-not-contact list
+        result.suppressed += n
+        for c in uniq:
+            score_fit(c, radius_miles, min_exp, max_exp, want)
+        uniq.sort(key=lambda c: rank_key(c, min_exp, max_exp, want))
+    people_rows = [c for c in uniq if c.kind == "candidate"]
+    if people_rows:
+        n_e = sum(1 for c in people_rows if c.email)
+        n_p = sum(1 for c in people_rows if c.phone)
+        result.contact_summary = (f"{n_e} of {len(people_rows)} people published an email"
+                                  + (f" and {n_p} a phone number" if n_p else "")
+                                  + " (source page shown for each). The rest can be messaged through their "
+                                    "profile link.")
     n_people = sum(1 for c in uniq if c.kind == "candidate")
     n_uk = sum(1 for c in uniq if c.kind == "candidate" and "no nearby town" in (c.location or ""))
     n_biz = sum(1 for c in uniq if c.kind == "business")

@@ -40,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="only GitHub users who marked themselves 'Available for hire'")
     p.add_argument("--no-quick-list", action="store_true",
                    help="leave out GitHub accounts whose profile wasn't read (rate limit / max profiles)")
+    p.add_argument("--enrich-top", type=int, default=60,
+                   help="follow the links on the top N people's profiles for contacts they published (0 = off)")
+    p.add_argument("--enrich-seconds", type=float, default=120, help="time limit for that contact check")
+    p.add_argument("--no-obfuscated", action="store_true",
+                   help="don't decode addresses written as 'name [at] domain [dot] com'")
     p.add_argument("--near-only", action="store_true",
                    help="leave out UK-based Bluesky/Mastodon people who don't name a town near the postcode")
     p.add_argument("--no-websites", action="store_true",
@@ -80,7 +85,9 @@ def main(argv=None) -> int:
                               all_presets=a.all_presets, company_pages=not a.no_company_pages,
                               max_profiles=a.max_profiles, max_towns=a.max_areas,
                               include_unknown_distance=a.include_unknown_distance, job_sources=a.job_sources,
-                              companies=a.companies, team_urls=a.team_url, contract=a.contract, uk_unknown=not a.near_only, progress=lambda m: print("  " + m, file=sys.stderr))
+                              companies=a.companies, team_urls=a.team_url, contract=a.contract, uk_unknown=not a.near_only,
+                              enrich_top=0 if a.no_websites else a.enrich_top, enrich_seconds=a.enrich_seconds,
+                              decode_obfuscated=not a.no_obfuscated, progress=lambda m: print("  " + m, file=sys.stderr))
     except PostcodeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -95,6 +102,8 @@ def main(argv=None) -> int:
             print("           " + ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in r.stats.items()), file=sys.stderr)
     if res.coverage:
         print(f"  note: {res.coverage}", file=sys.stderr)
+    if res.contact_summary:
+        print(f"  contacts: {res.contact_summary}", file=sys.stderr)
     if res.suppressed:
         print(f"  removed {res.suppressed} on the do-not-contact list", file=sys.stderr)
     print(f"{len(res.candidates)} records ({sum(1 for c in res.candidates if c.email)} with email). "
