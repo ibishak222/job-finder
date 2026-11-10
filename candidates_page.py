@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from recruit_scraper.candidates import suppression
-from recruit_scraper.candidates.engine import EXPORT_DIR, find_candidates, purge_old_exports
+from recruit_scraper.candidates.engine import EXPORT_DIR, SOURCE_LABELS, find_candidates, purge_old_exports
 from recruit_scraper.candidates.geo import PostcodeError
 from recruit_scraper.candidates.models import Candidate
 from ui_common import (STICKY_CSS, defaults, export_panel, finish_task, show_notice, show_running, start_task, tip,
@@ -27,6 +27,9 @@ GDPR_TEXT = """
   unsolicited emails to users, naming recruiters and headhunters. An email shown for a GitHub person was
   **self-published on their own website** (the source URL is recorded). Use it the way they invite on that site, and
   prefer people who marked themselves **Available for hire**.
+* **Bluesky / Mastodon:** only public profiles whose own bio mentions the job and a nearby place. Emails are never
+  lifted from bios; Mastodon results only include people who opted in to being discoverable, and Bluesky people who
+  hid their profile from logged-out visitors are skipped. Contact them through their profile or their own website.
 * **Hiring contacts** are business addresses that employers published in their job ads or on their own careers and
   contact pages.
 * **CV databases:** for UK jobseekers who have opted in to be contacted, the proper route is a paid recruiter account
@@ -42,7 +45,8 @@ def _frame(rows: list[dict]) -> pd.DataFrame:
     df["experience"] = [
         (f"{y:g} yrs (estimated)" if "estimated" in (src or "") else f"{y:g} yrs") if pd.notna(y) else ""
         for y, src in zip(df["experience_years"], df["experience_source"])]
-    for c in ("name", "headline", "company", "location", "email", "email_source", "website", "phone",
+    for c in ("name", "headline", "company", "location", "email", "email_source", "website", "phone", "provider",
+              "match_reason", "other_profiles",
               "linkedin_url", "twitter_url"):
         df[c] = df[c].fillna("")
     return df
@@ -53,7 +57,8 @@ EXPORT_COLUMNS = {
     "distance_miles": "Miles away", "experience_years": "Experience (years)", "experience_source": "Experience source",
     "hireable": "Available for hire", "email": "Email", "email_source": "Email source", "phone": "Phone",
     "profile_url": "Profile / ad link", "website": "Website", "linkedin_url": "LinkedIn", "twitter_url": "X / Twitter",
-    "provider": "Found via", "profile_read": "Profile read", "found_at": "Found at (UTC)", "personal_data": "Personal data",
+    "provider": "Found via", "match_reason": "Why they match", "other_profiles": "Other profiles",
+    "profile_read": "Profile read", "found_at": "Found at (UTC)", "personal_data": "Personal data",
 }
 LINK_HEADERS = ("Profile / ad link", "Website", "LinkedIn", "X / Twitter")
 NOTICE = ("PERSONAL DATA - UK GDPR applies. Use only with a lawful basis (legitimate interests assessment), inform people "
@@ -62,6 +67,7 @@ NOTICE_LINES = [
     NOTICE, "",
     "Where the data came from:",
     "- GitHub: public profile fields only. Emails are never taken from GitHub (GitHub Acceptable Use Policies).",
+    "- Bluesky / Mastodon: public bios that mention the job (Mastodon: only people who opted in to discovery).",
     "- 'self-published on personal website <url>': the person published it on their own site (source URL recorded).",
     "- 'published by the employer…': business hiring contacts from job ads or company careers/contact pages.",
     "",
@@ -92,7 +98,7 @@ def cand_exports(query: str) -> dict:
                                         meta={"query": query, "exported_at": datetime.now().isoformat(timespec="seconds")}),
     }
 
-CAND_DEFAULTS = {"c_github": True, "c_sites": True, "c_ads": True, "c_ads_presets": True, "c_hireable": False,
+CAND_DEFAULTS = {"c_github": True, "c_bsky": True, "c_masto": True, "c_sites": True, "c_ads": True, "c_ads_presets": True, "c_hireable": False,
                  "c_unread": True, "c_unknown": False, "c_retention": 30, "c_max_profiles": 200, "c_max_accounts": 600,
                  "c_areas": 6, "c_wait": 0, "c_title": "", "c_postcode": "", "c_radius": 15, "c_exp": (3, 30),
                  "c_keywords": "", "c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False}
@@ -103,18 +109,26 @@ def candidates_page():
     finish_task("cand_task", _apply)
     st.markdown(STICKY_CSS, unsafe_allow_html=True)
     st.title("🧑‍💼 Find candidates")
-    st.caption("Find people near a UK postcode from **lawful public sources**: public GitHub profiles (plus contact "
-               "details people published on their own websites) and hiring contacts that employers published. "
+    st.caption("Find people near a UK postcode from **lawful public sources**: public GitHub, Bluesky and Mastodon "
+               "profiles whose own bio matches the job (plus contact details people published on their own "
+               "websites) and hiring contacts that employers published. "
                "No LinkedIn/Indeed/Facebook scraping, no guessed emails.")
     tip("cands", "**How to use:** enter a job title/skills and a UK postcode, choose the radius and experience, then "
                  "press **Find people** (1–3 minutes; you can keep using the page). Use **Show** and the filter box "
-                 "to narrow the table, then download it. GitHub suits developer and data roles. Read the GDPR note "
+                 "to narrow the table, then download it. Only people whose own profile mentions the job are shown. GitHub "
+                 "suits developer and data roles; Bluesky and Mastodon cover other jobs too (thinly). Read the GDPR note "
                  "before contacting anyone.")
 
     with st.sidebar:
         st.header("Where to look")
         st.checkbox("GitHub public profiles", key="c_github",
-                    help="Developers/data people whose public GitHub location is near the postcode.")
+                    help="Developers/data people whose public GitHub location is near the postcode. Skipped "
+                         "automatically for non-software jobs.")
+        st.checkbox("Bluesky public profiles", key="c_bsky",
+                    help="People whose public Bluesky bio mentions the job and a place near the postcode. Any job.")
+        st.checkbox("Mastodon public profiles", key="c_masto",
+                    help="People on Mastodon who opted in to being discoverable and whose bio mentions the job and "
+                         "a nearby place. Any job."),
         st.toggle("Check their own websites for contact details", key="c_sites",
                   help="If a person links their own website/portfolio, read it politely (robots.txt and "
                        "noindex respected) and record an email/phone they published there themselves.")
@@ -148,7 +162,7 @@ def candidates_page():
         st.markdown(GDPR_TEXT)
 
     c1, c2 = st.columns([2, 1])
-    c1.text_input("Job title / skills", placeholder="e.g. python developer, react engineer, data scientist", key="c_title")
+    c1.text_input("Job title / skills", placeholder="e.g. electrician, accountant, care worker, python developer", key="c_title")
     c2.text_input("UK postcode", placeholder="e.g. M1 1AE", key="c_postcode")
     c3, c4, c5 = st.columns(3)
     c3.slider("Radius (miles)", 1, 50, key="c_radius",
@@ -178,13 +192,14 @@ def candidates_page():
                    disabled=running, key="cand_go")
     if b2.button("🧹 Clear results", width="stretch", key="cand_clear",
                  disabled=running or st.session_state.get("cand_results") is None):
-        for k in ("cand_results", "cand_meta", "cand_reports", "cand_task_notice"):
+        for k in ("cand_results", "cand_meta", "cand_reports", "cand_task_notice", "cand_coverage"):
             st.session_state.pop(k, None)
         st.rerun()
 
     if go:
         ss = st.session_state
-        providers = (["github"] if ss["c_github"] else []) + (["job_ads"] if ss["c_ads"] else [])
+        providers = ([p for p, k in (("github", "c_github"), ("bluesky", "c_bsky"), ("mastodon", "c_masto"))
+                      if ss[k]] + (["job_ads"] if ss["c_ads"] else []))
         title, postcode = ss["c_title"].strip(), ss["c_postcode"].strip()
         if not title or not postcode:
             st.error("Enter a job title and a UK postcode.")
@@ -226,8 +241,8 @@ def _apply(t) -> None:
     st.session_state["cand_meta"] = f"{t.label} ({res.place.town})" if res.place else t.label
     lines_ = []
     for r in res.reports:
-        icon = "✅" if r.status == "ok" else "❌"
-        name = {"github": "GitHub", "job_ads": "Hiring contacts"}.get(r.name, r.name)
+        icon = {"ok": "✅", "skipped": "⏭️"}.get(r.status, "❌")
+        name = SOURCE_LABELS.get(r.name, r.name)
         lines_.append(f"{icon} **{name}**: {r.found} found" + (f" · ℹ️ {r.message}" if r.message else ""))
         if r.stats:
             lines_.append("<small>" + " · ".join(f"{k.replace('_', ' ')}: {v}" for k, v in r.stats.items()) + "</small>")
@@ -236,6 +251,8 @@ def _apply(t) -> None:
     if getattr(t, "purged", 0):
         lines_.append(f"🗑️ Deleted {t.purged} old candidate export(s)")
     st.session_state["cand_reports"] = lines_
+    st.session_state["cand_coverage"] = res.coverage
+    st.session_state["cand_tech"] = res.tech_role
     st.session_state.update({"c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False})
 
 
@@ -253,10 +270,12 @@ def _results() -> None:
     if st.session_state.get("cand_reports"):
         with st.expander("Search details (sources, limits)"):
             st.markdown("  \n".join(st.session_state["cand_reports"]), unsafe_allow_html=True)
+    if st.session_state.get("cand_coverage"):
+        st.info("ℹ️ " + st.session_state["cand_coverage"])
     st.warning("🔐 Personal data. Use only with a lawful basis, and don't share these exports.")
     if df.empty:
-        st.info("Nobody matched. Try a bigger radius, fewer years of experience, turn off 'Available for hire', "
-                "or use a more technical job title (GitHub suits developer and data roles).")
+        st.info("Nobody's public profile matched this job near that postcode. Try a bigger radius, a more common "
+                "job title, or fewer years of experience - or use the hiring contacts on the **Jobs** page.")
         return
 
     f1, f2 = st.columns([2, 3])
@@ -302,9 +321,9 @@ def _results() -> None:
     if view.empty:
         st.info("No one matches these filters. Press **Reset filters** to see everyone again.")
     else:
-        cols = ["name", "profile_url", "email", "phone", "headline", "company", "location", "distance_miles",
-                "experience", "hireable", "email_source", "website", "linkedin_url", "twitter_url", "provider", "kind",
-                "found_at"]
+        cols = ["name", "provider", "profile_url", "match_reason", "email", "phone", "headline", "company", "location",
+                "distance_miles", "experience", "hireable", "email_source", "website", "other_profiles",
+                "linkedin_url", "twitter_url", "kind", "found_at"]
         st.dataframe(view[cols], hide_index=True, width="stretch", height=min(560, 38 + 35 * len(view)),
                      key="cand_table", column_config={
             "name": st.column_config.TextColumn("Name", pinned=True),
@@ -317,7 +336,10 @@ def _results() -> None:
             "experience": st.column_config.TextColumn("Experience", help="GitHub values are estimates from account age"),
             "hireable": "Available for hire",
             "email_source": st.column_config.TextColumn("Email source", width="large"),
-            "website": st.column_config.LinkColumn("Website"), "provider": "Found via", "kind": "Type",
+            "website": st.column_config.LinkColumn("Website"), "kind": "Type",
+            "provider": st.column_config.TextColumn("Found via", help="Which public source(s) this person came from"),
+            "match_reason": st.column_config.TextColumn("Why they match", width="medium"),
+            "other_profiles": st.column_config.TextColumn("Other profiles", width="medium"),
             "linkedin_url": st.column_config.LinkColumn("LinkedIn", display_text="LinkedIn ↗"),
             "twitter_url": st.column_config.LinkColumn("X / Twitter", display_text="X ↗"),
             "found_at": "Found at (UTC)"})

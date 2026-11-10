@@ -8,3 +8,6 @@ pandas>=2.0
 openpyxl>=3.1
 extruct>=0.17
 dateparser>=1.2
+# extra candidate sources (keyless public APIs): Bluesky via MarshalX/atproto, Mastodon via halcy/Mastodon.py
+atproto>=0.0.60,<0.1
+Mastodon.py>=2.0,<3

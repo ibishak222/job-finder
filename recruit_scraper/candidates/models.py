@@ -29,7 +29,10 @@ class Candidate:
     hireable: Optional[bool] = None
     kind: str = "candidate"       # candidate | hiring contact
     profile_read: Optional[bool] = None  # GitHub: False = quick-list row from search, profile not read yet
-    provider: str = ""
+    provider: str = ""            # where it was found, e.g. "github", "bluesky", "github + mastodon"
+    match_score: float = 0.0      # how well their own profile text matches the job (3 exact, 2 synonym, 1 skill)
+    match_reason: str = ""        # e.g. "profile says 'electrician'"
+    other_profiles: str = ""      # the same person's profiles on other sites (merged duplicates), space-separated
     found_at: str = field(default_factory=_now)
     personal_data: str = "yes - UK GDPR applies"
 

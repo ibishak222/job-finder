@@ -10,8 +10,13 @@ from typing import Callable, Optional
 from ..http import HttpClient
 from . import suppression
 from .geo import Place, PlaceGeocoder, lookup_postcode
+from .matching import is_tech_role
 from .models import Candidate
 from .providers import GitHubProvider, JobAdContactsProvider, ProviderStop
+from .social import BlueskyProvider, MastodonProvider
+
+PEOPLE_SOURCES = ("github", "bluesky", "mastodon")
+SOURCE_LABELS = {"github": "GitHub", "bluesky": "Bluesky", "mastodon": "Mastodon", "job_ads": "Hiring contacts"}
 
 log = logging.getLogger(__name__)
 EXPORT_DIR = Path(__file__).resolve().parents[2] / "output" / "candidates"
@@ -32,6 +37,60 @@ class CandidateResult:
     candidates: list[Candidate] = field(default_factory=list)
     reports: list[ProviderReport] = field(default_factory=list)
     suppressed: int = 0
+    tech_role: bool = True
+    coverage: str = ""   # friendly note when public sources cover this kind of job poorly
+
+
+def _norm_link(u: str) -> str:
+    u = (u or "").strip().lower()
+    u = u.split("://", 1)[-1].removeprefix("www.").rstrip("/")
+    return u
+
+
+def merge_duplicates(cands: list[Candidate]) -> list[Candidate]:
+    """One row per person across sources: same email, profile link, own website, or a profile one of them links to.
+    The better-matching row is kept; the other source is added to 'Found via' and its link to 'other_profiles'."""
+    out: list[Candidate] = []
+    index: dict[str, Candidate] = {}
+
+    def keys(c: Candidate) -> list[str]:
+        ks = [f"e:{c.email.lower()}"] if c.email else []
+        ks += [f"l:{_norm_link(u)}" for u in [c.profile_url, c.website] + (c.other_profiles or "").split() if u]
+        return ks
+
+    for c in sorted(cands, key=lambda c: -(c.match_score or 0)):
+        ks = keys(c)
+        hit = next((index[k] for k in ks if k in index), None)
+        if hit is None or c.kind != "candidate" or hit.kind != "candidate":
+            if hit is not None:
+                continue  # exact duplicate hiring contact
+            out.append(c)
+            for k in ks:
+                index[k] = c
+            continue
+        if c.provider not in hit.provider.split(" + "):
+            hit.provider = f"{hit.provider} + {c.provider}"
+        links = [u for u in (hit.other_profiles or "").split() if u]
+        if c.profile_url and _norm_link(c.profile_url) != _norm_link(hit.profile_url):
+            links.append(c.profile_url)
+        hit.other_profiles = " ".join(dict.fromkeys(links))
+        for f in ("email", "email_source", "phone", "website", "linkedin_url", "twitter_url", "location", "company"):
+            if not getattr(hit, f) and getattr(c, f):
+                setattr(hit, f, getattr(c, f))
+        if hit.distance_miles is None and c.distance_miles is not None:
+            hit.distance_miles = c.distance_miles
+        if hit.experience_years is None and c.experience_years is not None:
+            hit.experience_years, hit.experience_source = c.experience_years, c.experience_source
+        for k in ks:
+            index.setdefault(k, hit)
+    return out
+
+
+def rank_key(c: Candidate, min_exp: Optional[float] = None, max_exp: Optional[float] = None):
+    y = c.experience_years
+    exp_fit = 1 if y is None else (0 if (min_exp is None or y >= min_exp) and (max_exp is None or y <= max_exp) else 2)
+    return (c.kind != "candidate", -(c.match_score or 0), exp_fit, not c.email,
+            c.distance_miles if c.distance_miles is not None else 999)
 
 
 def filter_experience(cands: list[Candidate], min_exp: Optional[float], max_exp: Optional[float],
@@ -57,7 +116,7 @@ class SearchCancelled(Exception):
 
 
 def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp: Optional[float] = None,
-                    max_exp: Optional[float] = None, keywords: list[str] = (), providers: list[str] = ("github",),
+                    max_exp: Optional[float] = None, keywords: list[str] = (), providers: list[str] = PEOPLE_SOURCES,
                     github_token: Optional[str] = None, hireable_only: bool = False, max_profiles: int = 200,
                     max_towns: int = 6, include_unknown_distance: bool = False, job_sources: list[str] = (),
                     companies: list[str] = (), suppression_entries: Optional[list[str]] = None,
@@ -82,26 +141,38 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
     geocoder = PlaceGeocoder(pc_http)
     found: list[Candidate] = []
 
+    result.tech_role = tech = is_tech_role(title)
+    people = []
     if "github" in providers:
-        gh = GitHubProvider(http, token=github_token, max_towns=max_towns, max_profiles=max_profiles,
-                            hireable_only=hireable_only, max_results=max_results, include_unread=include_unread,
-                            fetch_websites=fetch_websites, max_wait_minutes=max_wait_minutes)
-        rep = ProviderReport("github", "ok")
+        people.append(GitHubProvider(http, token=github_token, max_towns=max_towns, max_profiles=max_profiles,
+                                     hireable_only=hireable_only, max_results=max_results,
+                                     include_unread=include_unread, fetch_websites=fetch_websites,
+                                     max_wait_minutes=max_wait_minutes))
+    if "bluesky" in providers and not hireable_only:
+        people.append(BlueskyProvider(fetch_websites=fetch_websites))
+    if "mastodon" in providers and not hireable_only:
+        people.append(MastodonProvider(fetch_websites=fetch_websites))
+    for prov in people:
+        rep = ProviderReport(prov.name, "ok")
         try:
-            for c in gh.search(title, place, radius_miles, min_exp, max_exp, list(keywords),
-                               include_unknown_distance, geocoder, progress):
+            for c in prov.search(title, place, radius_miles, min_exp, max_exp, list(keywords),
+                                 include_unknown_distance, geocoder, progress):
                 found.append(c)
                 rep.found += 1
         except ProviderStop as e:
             rep.status, rep.message = ("ok" if rep.found else "error"), str(e)
         except SearchCancelled:
             raise
+        except ImportError as e:
+            rep.status, rep.message = "error", f"library not installed ({e.name}); run pip install -r requirements.txt"
         except Exception as e:  # noqa: BLE001
-            log.exception("github provider failed")
-            rep.status, rep.message = "error", f"GitHub search failed: {e}"
-        if gh.notes:
-            rep.message = "; ".join(dict.fromkeys(filter(None, [rep.message] + gh.notes)))
-        rep.stats = gh.stats
+            log.exception("%s provider failed", prov.name)
+            rep.status, rep.message = "error", f"{SOURCE_LABELS.get(prov.name, prov.name)} search failed: {e}"
+        if prov.notes:
+            rep.message = "; ".join(dict.fromkeys(filter(None, [rep.message] + prov.notes)))
+        rep.stats = prov.stats
+        if prov.name == "github" and not tech and not rep.found:
+            rep.status = "skipped"
         result.reports.append(rep)
 
     if "job_ads" in providers:
@@ -124,17 +195,24 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
         rep.stats = ja.stats
         result.reports.append(rep)
 
-    # de-duplicate (profile URL / email)
-    seen, uniq = set(), []
-    for c in found:
-        key = (c.email or c.profile_url).lower()
-        if key and key not in seen:
-            seen.add(key)
-            uniq.append(c)
+    # people must match the job in their own profile text; never pad with location-only results
+    found = [c for c in found if c.kind != "candidate" or (c.match_score or 0) > 0]
+    uniq = merge_duplicates(found)
     entries = suppression.load() if suppression_entries is None else suppression_entries
     uniq, result.suppressed = suppression.apply(uniq, entries)
-    uniq.sort(key=lambda c: (c.kind != "candidate", not c.email, c.profile_read is False,
-                             c.distance_miles if c.distance_miles is not None else 999))
+    uniq.sort(key=lambda c: rank_key(c, min_exp, max_exp))
+    n_people = sum(1 for c in uniq if c.kind == "candidate")
+    if not tech:
+        result.coverage = (f"'{title}' isn't a software job, so GitHub (developers only) was skipped. People were "
+                           "looked for on Bluesky and Mastodon, where they describe their own job in their bio. Free "
+                           "public sources cover jobs like this thinly"
+                           + (f": only {n_people} matching people found near {place.town}." if n_people else
+                              f", and nobody near {place.town} matched.")
+                           + " For more reach, use the hiring contacts on the Jobs page, or a CV database "
+                             "(Reed, Totaljobs or CV-Library) where jobseekers opted in to be contacted.")
+    elif not n_people:
+        result.coverage = (f"Nobody near {place.town} mentions '{title}' in a public profile. Try a broader title "
+                           "(e.g. 'developer'), a bigger radius, or fewer years of experience.")
     result.candidates = uniq
     return result
 

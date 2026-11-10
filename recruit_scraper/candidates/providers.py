@@ -26,6 +26,7 @@ from ..http import HttpClient
 from .cache import DiskCache
 from .contacts import SiteContactFinder
 from .geo import Place, PlaceGeocoder, haversine_miles
+from .matching import RoleMatcher, is_tech_role
 from .models import Candidate
 
 log = logging.getLogger(__name__)
@@ -180,8 +181,12 @@ class GitHubProvider:
             quals.append(f"created:>={today - timedelta(days=int(max_exp * 365.25))}")
         quals.append("type:user")
         if not langs:
-            self.notes.append("No programming language recognised in the job title, so GitHub results are not "
-                              "skill-filtered (GitHub mainly suits developer/data roles).")
+            if not is_tech_role(title):
+                self.notes.append(f"Skipped: '{title}' isn't a software/data job, and GitHub only lists people "
+                                  "who write code.")
+                return []
+            self.notes.append("No programming language recognised in the job title, so only people whose GitHub "
+                              "bio mentions the job are kept.")
         out = []
         for area in location_variants(place, self.max_towns):
             loc = f'location:"{area}"' if " " in area else f"location:{area}"
@@ -222,7 +227,11 @@ class GitHubProvider:
     def search(self, title: str, place: Place, radius_miles: float, min_exp: Optional[float],
                max_exp: Optional[float], keywords: list[str], include_unknown_distance: bool,
                geocoder: PlaceGeocoder, progress: Callable[[str], None] = lambda m: None) -> Iterator[Candidate]:
+        matcher = RoleMatcher(title, keywords)
+        langs = languages_for(title)[:3]
         queries = self.build_queries(title, place, min_exp, max_exp)
+        if not queries:
+            return
         progress(f"GitHub: {len(queries)} search variants (areas × skills)")
         logins = self._collect_logins(queries, progress)
         self.stats["accounts_found"] = len(logins)
@@ -272,6 +281,11 @@ class GitHubProvider:
             text = " ".join(str(u.get(k) or "") for k in ("bio", "company", "name", "blog")).lower()
             if kws and not any(all(w in text for w in k.split()) for k in kws):
                 continue
+            m = matcher.match(u.get("bio"), u.get("company"), u.get("name"), u.get("blog"))
+            if not m.score:
+                if not langs:
+                    continue  # no skill signal at all -> their bio has to mention the job
+                m.score, m.reason = 1.0, f"has public code in {' / '.join(langs[:2])} (GitHub language search)"
             dist = None
             coords = geocoder.geocode(u.get("location") or "")
             if coords:
@@ -298,7 +312,8 @@ class GitHubProvider:
                 linkedin_url=blog if "linkedin.com" in blog.lower() else "",
                 twitter_url=f"https://x.com/{u['twitter_username']}" if u.get("twitter_username") else "",
                 hireable=bool(u.get("hireable")) if u.get("hireable") is not None else None,
-                kind="candidate", provider="github", profile_read=True)
+                kind="candidate", provider="github", profile_read=True,
+                match_score=m.score, match_reason=m.reason)
             cands.append(c)
 
         if self.fetch_websites:
@@ -322,7 +337,7 @@ class GitHubProvider:
                                   "not collected from GitHub (GitHub policy)")
             yield c
 
-        if self.include_unread and not self.hireable_only and not kws:
+        if self.include_unread and not self.hireable_only and not kws and langs:
             for login in unread:
                 area = logins[login]
                 if area not in area_dist:
@@ -338,7 +353,8 @@ class GitHubProvider:
                     experience_years=None,
                     experience_source=(f"account at least {min_exp:g} years old (search filter)" if min_exp else ""),
                     email_source="profile not read yet", profile_url=f"https://github.com/{login}",
-                    kind="candidate", provider="github (quick list)", profile_read=False)
+                    kind="candidate", provider="github (quick list)", profile_read=False, match_score=0.5,
+                    match_reason=f"GitHub language search ({' / '.join(langs[:2])}); profile not read yet")
 
 
 class JobAdContactsProvider:
