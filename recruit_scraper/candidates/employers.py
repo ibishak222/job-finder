@@ -32,7 +32,9 @@ log = logging.getLogger(__name__)
 ODS = "https://directory.spineservices.nhs.uk/ORD/2-0-0/organisations"
 ODS_ROLES = {"gp": "RO76", "care_home": "RO269", "home_care": "RO270", "dental": "RO110", "pharmacy": "RO182"}
 TYPE_LABELS = {"gp": "GP practice", "care_home": "Care home / nursing home", "home_care": "Home care agency",
-               "dental": "Dental practice", "pharmacy": "Pharmacy", "hospital": "Hospital", "clinic": "Clinic"}
+               "dental": "Dental practice", "pharmacy": "Pharmacy", "hospital": "Hospital", "clinic": "Clinic",
+               "urgent_care": "Urgent care / walk-in / out-of-hours", "nurse_agency": "Nursing agency",
+               "community": "Community nursing service"}
 OSM_FILTERS = {
     "gp": ['["amenity"="doctors"]', '["healthcare"="doctor"]'],
     "care_home": ['["social_facility"~"^(nursing_home|assisted_living)$"]', '["amenity"="nursing_home"]',
@@ -47,8 +49,11 @@ OSM_FILTERS = {
 ROLE_EMPLOYERS: list[tuple[re.Pattern, list[str]]] = [
     (re.compile(r"\bdental|dentist|hygienist\b", re.I), ["dental"]),
     (re.compile(r"\bpharmac", re.I), ["pharmacy"]),
-    (re.compile(r"\b(practice|gp|general practice|treatment room|surgery) nurse|practice manager|gp receptionist|"
-                r"medical receptionist|phlebotom", re.I), ["gp"]),
+    (re.compile(r"\b(advanced nurse practitioner|nurse practitioner|anp|advanced clinical practitioner|"
+                r"nurse prescriber)\b", re.I), ["gp", "urgent_care"]),
+    (re.compile(r"\b(practice|gp|general practice|treatment room|surgery|primary care) nurse|\bgpn\b|practice manager|"
+                r"gp receptionist|medical receptionist|phlebotom", re.I), ["gp"]),
+    (re.compile(r"\b(district|community) (nurse|nursing|staff nurse)", re.I), ["community", "gp", "care_home"]),
     (re.compile(r"\b(care|support) (worker|assistant)|carer|domiciliary|home care|senior carer|care giver|caregiver|"
                 r"activities coordinator|care home", re.I), ["care_home", "home_care"]),
     (re.compile(r"\b(hca|health ?care assistant|nursing assistant|nursing associate|clinical support)", re.I),
@@ -62,11 +67,36 @@ ROLE_EMPLOYERS: list[tuple[re.Pattern, list[str]]] = [
 ]
 
 
+_NURSING = re.compile(r"\bnurs|\brgn\b|\brmn\b|\banp\b|\bgpn\b|\bhca\b|health ?care assistant|practitioner", re.I)
+
+
 def employer_kinds(title: str) -> list[str]:
+    from .matching import contract_type
     for rx, kinds in ROLE_EMPLOYERS:
         if rx.search(title or ""):
+            kinds = list(kinds)
+            if contract_type(title or "") == "temporary" and _NURSING.search(title or ""):
+                # locum / bank nursing: also out-of-hours / urgent care and the nursing agencies that place locums
+                kinds += [k for k in ("urgent_care", "nurse_agency") if k not in kinds]
             return kinds
     return []
+
+
+# which employers come first for a role: the core employer (GP practices for a practice nurse), then the rest
+def _tier(lead: "EmployerLead", kinds: list[str]) -> int:
+    t = (lead.employer_type or "").lower()
+    order = {"gp": r"gp practice|doctors", "urgent_care": r"urgent care|walk-in|out-of-hours",
+             "nurse_agency": r"nurse agency|nursing agency", "community": r"community (nursing|health)",
+             "care_home": r"care home|nursing home", "home_care": r"home care|care at home|housing support|domiciliary",
+             "hospital": r"hospital|hospice", "clinic": r"clinic|community"}
+    for i, k in enumerate(kinds):
+        if k in order and re.search(order[k], t):
+            return i
+    return len(kinds)
+
+
+def contactability(lead: "EmployerLead") -> int:
+    return 4 * bool(lead.email) + 2 * bool(lead.website) + 2 * bool(lead.phone) + bool(lead.contact_name)
 
 
 @dataclass
@@ -183,12 +213,14 @@ class EmployerLeadsFinder:
 
     def __init__(self, http: Optional[HttpClient] = None, osm_http: Optional[HttpClient] = None,
                  max_districts: int = 15, max_details: int = 40, max_leads: int = 250, max_geocode: int = 600,
-                 osm_radius_miles: float = 6, registers=True, max_named: int = 150):
+                 osm_radius_miles: float = 6, registers=True, max_named: int = 150, practice_sites: int = 30,
+                 practice_seconds: float = 45):
         self.http = http or HttpClient(min_interval=0.3, timeout=30, retries=2, backoff=2)
         self.osm_http = osm_http or overpass_http()  # short timeouts + overall budget: don't stall the search
         self.max_districts, self.max_details, self.max_leads = max_districts, max_details, max_leads
         self.max_geocode, self.osm_radius = max_geocode, osm_radius_miles
         self.registers, self.max_named = registers, max_named     # True / False / a RegistersFinder (tests)
+        self.practice_sites, self.practice_seconds = practice_sites, practice_seconds
         self.cache = DiskCache("employers", 7 * 86400)
         self.osm_cache = DiskCache("osm", 86400)
         self.notes: list[str] = []
@@ -368,7 +400,7 @@ class EmployerLeadsFinder:
                        progress: Callable[[str], None]) -> tuple[list[EmployerLead], list[EmployerLead]]:
         from .registers import RegistersFinder
         try:
-            dists = self.districts(place, radius_miles)
+            dists = None if place.nationwide else self.districts(place, radius_miles)
         except (requests.RequestException, ValueError) as e:
             self.notes.append(f"postcode districts unavailable ({type(e).__name__}); official registers skipped")
             return [], []
@@ -387,6 +419,67 @@ class EmployerLeadsFinder:
             (named if r.named_person else emp).append(lead)
         return emp, named
 
+    # --- the practice's own website ----------------------------------------------------------------------------
+    def _cap(self, leads: list[EmployerLead], kinds: list[str]) -> list[EmployerLead]:
+        """First max_leads, but each other kind asked for (nurse agencies, urgent care for a locum search) keeps a
+        share, so 250 GP practices can't push every agency out of the list."""
+        if len(leads) <= self.max_leads or len(kinds) < 2:
+            return leads[: self.max_leads]
+        share = self.max_leads // (2 * len(kinds))
+        keep: set[int] = set()
+        for t in range(1, len(kinds)):
+            keep.update(id(l) for l in [l for l in leads if _tier(l, kinds) == t][:share])
+        room = self.max_leads - len(keep)
+        out = []
+        for l in leads:
+            if id(l) in keep:
+                out.append(l)
+            elif room > 0:
+                out.append(l)
+                room -= 1
+        return out
+
+    def practice_sites_contacts(self, leads: list[EmployerLead], progress: Callable[[str], None]) -> None:
+        """For the top GP practices / clinics with a website: the contact email and practice manager / lead nurse
+        name the practice publishes on its OWN site (robots.txt respected, cached, time-boxed, a few in parallel)."""
+        import time
+        from concurrent.futures import ThreadPoolExecutor, wait
+        from .contacts import SiteContactFinder
+        todo = [l for l in leads if l.website and not (l.email and l.contact_name)][: self.practice_sites]
+        if not todo:
+            return
+        progress(f"Practice websites: reading the contact page of {len(todo)} practices for the email and practice "
+                 "manager they publish…")
+        finder = SiteContactFinder(HttpClient(min_interval=0.5, timeout=10, retries=0))
+        end = time.monotonic() + self.practice_seconds
+        n_e = n_m = 0
+        pool = ThreadPoolExecutor(max_workers=8)
+        futs = {pool.submit(finder.practice, l.website): l for l in todo}
+        done, _ = wait(futs, timeout=max(1.0, end - time.monotonic()))
+        pool.shutdown(wait=False, cancel_futures=True)
+        for f in done:
+            l = futs[f]
+            try:
+                got = f.result()
+            except Exception as e:  # noqa: BLE001 - one bad site never stops the search
+                log.info("practice site %s failed: %s", l.website, e)
+                continue
+            src = got.get("source_url") or l.website
+            if got.get("emails") and not l.email:
+                l.email = got["emails"][0]
+                n_e += 1
+            if got.get("managers") and not l.contact_name:
+                l.contact_name, role = got["managers"][0]
+                l.contact_role = f"{role} (named on the practice's own website)"
+                n_m += 1
+            if got.get("emails") or got.get("managers"):
+                if "practice website" not in l.source:
+                    l.source += " + practice website"
+                    l.source_url = f"{l.source_url} {src}".strip()
+        self.stats.update(practice_sites_checked=len(done), practice_site_emails=n_e, practice_site_managers=n_m)
+        if len(done) < len(todo):
+            self.notes.append(f"practice websites: {len(todo) - len(done)} not read (time limit)")
+
     # --- both ------------------------------------------------------------------------------------------------
     def find(self, title: str, place: Place, radius_miles: float, entries: Iterable[str] = (),
              progress: Callable[[str], None] = lambda m: None) -> tuple[list[EmployerLead], int]:
@@ -394,13 +487,15 @@ class EmployerLeadsFinder:
         if not kinds:
             return [], 0
         ods: list[EmployerLead] = []
-        try:
-            ods = self.ods_leads(kinds, place, radius_miles, progress)
-        except (requests.RequestException, ValueError) as e:
-            log.info("ods failed: %s", e)
-            self.notes.append(f"NHS ODS unavailable ({e})")
-        # Overpass: nearest few miles only (a 15-mile query in London returns thousands and times out)
-        osm = self.osm_leads(kinds, place, min(radius_miles, self.osm_radius), progress)
+        osm: list[EmployerLead] = []
+        if not place.nationwide:   # the ODS API and the map search work around a postcode; whole-UK uses registers
+            try:
+                ods = self.ods_leads(kinds, place, radius_miles, progress)
+            except (requests.RequestException, ValueError) as e:
+                log.info("ods failed: %s", e)
+                self.notes.append(f"NHS ODS unavailable ({e})")
+            # Overpass: nearest few miles only (a 15-mile query in London returns thousands and times out)
+            osm = self.osm_leads(kinds, place, min(radius_miles, self.osm_radius), progress)
         leads = merge_leads(ods, osm)
         named: list[EmployerLead] = []
         if self.registers:
@@ -409,9 +504,17 @@ class EmployerLeadsFinder:
         leads, n = suppress_leads(leads, entries)
         named, n2 = suppress_leads(named, entries)
         n += n2
-        leads.sort(key=lambda l: (l.distance_miles is None, l.distance_miles or 0, l.name))
+        # the right kind of employer first, then nearest (in 3-mile bands) and most contactable
+        tiered = len(kinds) <= 3        # a broad title ('nurse') keeps every kind of employer mixed by distance
+        leads.sort(key=lambda l: (_tier(l, kinds) if tiered else 0, l.distance_miles is None, int((l.distance_miles or 0) // 3),
+                                  -contactability(l), l.distance_miles or 0, l.name))
         named.sort(key=lambda l: (l.distance_miles is None, l.distance_miles or 0, l.name))
-        leads = leads[: self.max_leads] + named[: self.max_named]
+        leads = self._cap(leads, kinds if tiered else [])
+        if self.practice_sites and self.registers:
+            self.practice_sites_contacts(leads, progress)
+            leads, n3 = suppress_leads(leads, entries)   # a newly found email may be on the do-not-contact list
+            n += n3
+        leads = leads + named[: self.max_named]
         self.stats.update(with_phone=sum(1 for l in leads if l.phone), with_website=sum(1 for l in leads if l.website),
                           with_email=sum(1 for l in leads if l.email))
         return leads, n

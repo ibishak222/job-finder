@@ -27,7 +27,10 @@ SOURCE_INFO = {
     "arbeitnow": ("Arbeitnow", "Large job board, mostly Germany/EU plus remote roles.", True),
     "jsonld": ("Any careers page (paste links)", "Reads job details from careers pages you paste below.", True),
     "nhsjobs": ("NHS Jobs (UK)", "NHS and NHS-funded jobs in England & Wales (nurses, HCAs, admin, doctors…). "
-                "Shows Permanent / Fixed-term / Bank / Locum.", True),
+                "Shows Permanent / Fixed-term / Bank / Locum. A locum / bank title asks for those contracts.", True),
+    "nhsscotland": ("NHS Scotland Jobs", "NHS boards in Scotland (apply.jobs.scot.nhs.uk): staff bank, fixed-term and "
+                    "permanent nursing posts, with pay, hours and closing date.", True),
+    "hscni": ("HSC Northern Ireland jobs", "HSC trusts and GP federations in Northern Ireland (jobs.hscni.net).", True),
     "reed": ("Reed.co.uk (UK)", "Big UK job board – needs a free Reed API key.", True),
     "adzuna": ("Adzuna (UK)", "UK job search engine – needs a free Adzuna app ID + key.", True),
 }
@@ -52,7 +55,8 @@ def jobs_to_frame(jobs: list[dict]) -> pd.DataFrame:
     df["where_found"] = df["source"].map(source_label)
     df["remote"] = df["remote"].map({True: "Yes", False: "No"}).fillna("")
     df["contract"] = [contract_bucket(t) for t in df["employment_type"]]
-    for c in ("company", "location", "employment_type", "contact_email", "contact_phone", "description"):
+    df["closing_date"] = pd.to_datetime(df["closing_date"], errors="coerce").dt.date
+    for c in ("company", "location", "employment_type", "contact_email", "contact_phone", "description", "hours"):
         df[c] = df[c].fillna("")
     return df
 
@@ -62,7 +66,7 @@ EXPORT_COLUMNS = {  # column -> friendly header (Excel/CSV). JSON keeps the plai
     "salary_min": "Salary min", "salary_max": "Salary max", "salary_currency": "Currency", "salary_period": "Salary period",
     "posted_date": "Posted", "employment_type": "Type", "remote": "Remote", "contact_email": "Contact email",
     "contact_phone": "Contact phone", "url": "Job link", "where_found": "Found on", "source": "Source id",
-    "salary_raw": "Salary as written", "description": "Description", "scraped_at": "Collected at (UTC)",
+    "closing_date": "Closing date", "hours": "Hours / sessions", "salary_raw": "Pay as written", "description": "Description", "scraped_at": "Collected at (UTC)",
 }
 CONTACT_COLS = ("contact_email", "contact_phone")
 

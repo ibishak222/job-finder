@@ -32,6 +32,7 @@ class Place:
     region: str          # e.g. "North West"
     country: str
     nearby_towns: list[str] = field(default_factory=list)  # districts within the radius, nearest/most common first
+    nationwide: bool = False   # a whole-UK search ('UK' / 'United Kingdom' instead of a postcode)
 
 
 def haversine_miles(lat1, lon1, lat2, lon2) -> float:
@@ -42,7 +43,25 @@ def haversine_miles(lat1, lon1, lat2, lon2) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+NATIONWIDE_WORDS = {"UK", "U.K.", "UNITED KINGDOM", "GB", "GREAT BRITAIN", "ALL UK", "WHOLE UK", "UK-WIDE",
+                    "UK WIDE", "NATIONWIDE", "ANYWHERE IN THE UK"}
+# centre of the UK (near Dunsop Bridge) - every UK town is within ~450 miles, so 'nationwide' = a 600-mile radius
+UK_CENTRE = (54.0, -2.55)
+NATIONWIDE_MILES = 600.0
+
+
+def is_nationwide(text: str) -> bool:
+    return " ".join((text or "").strip().upper().split()) in NATIONWIDE_WORDS
+
+
+def nationwide_place() -> Place:
+    return Place(postcode="UK", lat=UK_CENTRE[0], lon=UK_CENTRE[1], town="United Kingdom", region="",
+                 country="United Kingdom", nearby_towns=[], nationwide=True)
+
+
 def lookup_postcode(http: HttpClient, postcode: str, radius_miles: float = 10) -> Place:
+    if is_nationwide(postcode):
+        return nationwide_place()   # no lookup needed: every UK nation, no distance limit
     pc = " ".join(postcode.strip().upper().split())
     try:
         if _POSTCODE_RE.match(pc):
@@ -53,7 +72,8 @@ def lookup_postcode(http: HttpClient, postcode: str, radius_miles: float = 10) -
             town = (r.get("admin_district") or [""])[0]
             region = (r.get("region") or [""])[0] if isinstance(r.get("region"), list) else (r.get("region") or "")
         else:
-            raise PostcodeError(f"'{postcode}' doesn't look like a UK postcode (e.g. M1 1AE or M1)")
+            raise PostcodeError(f"'{postcode}' doesn't look like a UK postcode (e.g. M1 1AE or M1) - or type UK "
+                                "for a whole-UK search")
     except requests.HTTPError as e:
         if getattr(e.response, "status_code", None) == 404:
             raise PostcodeError(f"postcode '{postcode}' not found") from e

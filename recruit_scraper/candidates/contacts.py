@@ -107,7 +107,41 @@ def parse_page(html: str, base_url: str) -> dict:
     for e in find_emails(text):
         if e not in emails:
             emails.append(e)
-    return {"emails": emails, "phones": clean_phones(phones, text), "linkedin": linkedin, "twitter": twitter}
+    return {"emails": emails, "phones": clean_phones(phones, text), "linkedin": linkedin, "twitter": twitter,
+            "managers": practice_managers(text)}
+
+
+_NAME = r"((?:Mrs|Mr|Ms|Miss|Dr)\.?\s+)?([A-Z][a-z'’\-]+(?:\s+[A-Z][a-z'’\-]+){1,2})"
+_PM_ROLE = r"(Practice Manager|Practice Business Manager|Business Manager|Managing Partner|Lead Nurse|Nurse Manager|" \
+           r"Senior Practice Nurse|Lead Practice Nurse)"
+_PM_AFTER = re.compile(_PM_ROLE + r"\s*(?:is\s+)?[:\-–—,]?\s+" + _NAME)
+_PM_BEFORE = re.compile(_NAME + r"\s*(?:[,\-–—(|]\s*|\s+is\s+(?:our|the)\s+|\s+)" + _PM_ROLE)
+_NOT_NAME = re.compile(r"\b(Our|The|Your|Contact|Meet|Team|Practice|Surgery|Medical|Centre|Health|Nurse|Manager|Partner|"
+                       r"Email|Phone|Telephone|Opening|Hours|Patient|Patients|Services|Appointments|Reception|Home|"
+                       r"About|News|Staff|Clinical|Doctors?|Gp|Nhs|Lead|Senior|Business|Managing|Admin|Address|Who|"
+                       r"We|Us|Please|If|For|And|Or|To|Of|In|At|On|By|With)\b")
+
+
+def practice_managers(text: str, limit: int = 3) -> list[tuple[str, str]]:
+    """(name, role) for the practice manager / lead nurse a surgery names on its OWN website ('Practice Manager:
+    Jane Smith', 'Jane Smith - Practice Manager'). Business contacts the organisation chose to publish."""
+    t = re.sub(r"\s+", " ", text or "")[:300_000]
+    out: list[tuple[str, str]] = []
+    for rx, ni, ri in ((_PM_AFTER, 3, 1), (_PM_BEFORE, 2, 3)):
+        for m in rx.finditer(t):
+            name, role = m.group(ni).strip(), m.group(ri)
+            if _NOT_NAME.search(name) or len(name) > 40:
+                continue
+            title = (m.group(ni - 1) or "").strip()
+            full = f"{title} {name}".strip()
+            if full not in [o[0] for o in out]:
+                out.append((full, role))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+_NHS_MAIL = re.compile(r"@(nhs\.net|[\w.-]*nhs\.(uk|scot)|hscni\.net|[\w.-]*\.hscni\.net|wales\.nhs\.uk)$", re.I)
 
 
 def clean_phones(raw: list[str], text: str = "", max_from_text: int = 2) -> list[str]:
@@ -203,6 +237,39 @@ class SiteContactFinder:
             res["linkedin"] = res["linkedin"] or got.get("linkedin")
             res["twitter"] = res["twitter"] or got.get("twitter")
             if res["emails"]:
+                break
+        return res
+
+    def practice(self, site_url: str) -> dict:
+        """What a GP practice / clinic publishes on its OWN website: its contact email(s) and the practice manager's
+        name. Only emails on the practice's own domain or an NHS / HSC address are kept (never third-party ones);
+        robots.txt and noindex are respected, pages are cached."""
+        url = normalise_url(site_url)
+        res = {"emails": [], "managers": [], "source_url": None, "note": ""}
+        if not url or is_no_fetch(url):
+            return res
+        host = _host(url).removeprefix("www.")
+        base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        for page in (url, urljoin(base, "/contact-us"), urljoin(base, "/contact"), urljoin(base, "/practice-staff")):
+            got = self._fetch(page)
+            if not got:
+                continue
+            if got.get("skipped"):
+                res["note"] = f"skipped ({got['skipped']})"
+                if page == url:
+                    return res
+                continue
+            for e in got.get("emails", []):
+                dom = e.rsplit("@", 1)[-1].lower()
+                own = dom == host or dom.endswith("." + host) or host.endswith("." + dom)
+                if find_emails(e) and (own or _NHS_MAIL.search(e)) and e not in res["emails"]:
+                    res["emails"].append(e)
+                    res["source_url"] = res["source_url"] or got.get("url") or page
+            for name, role in got.get("managers") or []:
+                if name not in [m[0] for m in res["managers"]]:
+                    res["managers"].append((name, role))
+                    res["source_url"] = res["source_url"] or got.get("url") or page
+            if res["emails"] and res["managers"]:
                 break
         return res
 

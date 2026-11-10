@@ -315,8 +315,13 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
     result = CandidateResult()
     progress(f"Looking up postcode {postcode}…")
     result.place = place = lookup_postcode(pc_http, postcode, radius_miles)
-    progress(f"{place.postcode} is in {place.town}, {place.region}. Areas within {radius_miles:g} miles: "
-             f"{', '.join(place.nearby_towns[:8])}")
+    if place.nationwide:
+        from .geo import NATIONWIDE_MILES
+        radius_miles = NATIONWIDE_MILES   # whole UK: England, Scotland, Wales and Northern Ireland
+        progress("Whole-UK search: England, Scotland, Wales and Northern Ireland (no town needed)…")
+    else:
+        progress(f"{place.postcode} is in {place.town}, {place.region}. Areas within {radius_miles:g} miles: "
+                 f"{', '.join(place.nearby_towns[:8])}")
     geocoder = PlaceGeocoder(pc_http)
     found: list[Candidate] = []
 
@@ -333,7 +338,7 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
     if "mastodon" in providers and not hireable_only:
         people.append(MastodonProvider(fetch_websites=fetch_websites and not enrich_top, uk_unknown=uk_unknown,
                                        decode_obfuscated=decode_obfuscated))
-    if "openstreetmap" in providers and not hireable_only:
+    if "openstreetmap" in providers and not hireable_only and not place.nationwide:  # map search needs a town
         people.append(OpenStreetMapProvider(fetch_websites=fetch_websites))
     if ("team_pages" in providers or team_urls) and not hireable_only and team_urls:
         people.append(TeamPageProvider(list(team_urls)))
@@ -440,6 +445,7 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
                                      else " The rest can be messaged through their profile link.")
                                   + (f" Plus {len(research)} clinical researchers (Europe PMC) with a research "
                                      "correspondence email, listed after the candidates." if research else ""))
+    where = "across the UK" if place.nationwide else f"near {place.town}"
     n_people = sum(1 for c in uniq if c.kind == "candidate" and not is_research_only(c))
     n_uk = sum(1 for c in uniq if c.kind == "candidate" and "no nearby town" in (c.location or ""))
     n_biz = sum(1 for c in uniq if c.kind == "business")
@@ -452,11 +458,11 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
                            + (f": {n_people} matching people" if n_people else ": nobody's public profile matched")
                            + (f" ({n_uk} of them UK-based but not naming a town near here - ranked lower)" if n_uk else "")
                            + (f" and {n_biz} businesses (firms / sole traders, not job seekers)" if n_biz else "")
-                           + f" near {place.town}."
+                           + f" {where}."
                            + " For more reach, use the hiring contacts on the Jobs page, or a CV database "
                              "(Reed, Totaljobs or CV-Library) where jobseekers opted in to be contacted.")
     elif not n_people:
-        result.coverage = (f"Nobody near {place.town} mentions '{title}' in a public profile. Try a broader title "
+        result.coverage = (f"Nobody {where} mentions '{title}' in a public profile. Try a broader title "
                            "(e.g. 'developer'), a bigger radius, or fewer years of experience.")
     result.candidates = uniq
     if employers and employer_kinds(title):
@@ -479,7 +485,7 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
             kinds = ", ".join(dict.fromkeys(l.employer_type for l in result.employers))
             srcs = ", ".join(dict.fromkeys(s.strip() for l in result.employers for s in l.source.split("+") if s.strip()))
             named = sum(1 for l in result.employers if l.contact_name)
-            result.employers_note = (f"{len(result.employers)} employers near {place.town} that hire this kind of "
+            result.employers_note = (f"{len(result.employers)} employers {where} that hire this kind of "
                                      f"worker ({kinds}) - organisations to approach, not candidates"
                                      + (f"; {named} name a professional from the register (not job-seekers)"
                                         if named else "") + f". Contact details from {srcs or 'NHS ODS'}.")

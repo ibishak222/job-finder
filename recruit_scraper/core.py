@@ -67,7 +67,12 @@ def _keyword_rule(keyword: str):
     return (rm if role else None), _phrase_re(k)
 
 
-def keyword_hit(job: Job, keyword: str) -> bool:
+_HOSPITAL_ONLY = re.compile(r"\b(pre[- ]?op|theatres?|ward|inpatient|icu|itu|critical care|a ?& ?e|emergency department|"
+                            r"addiction|mental health|paediatric|neonatal|maternity|oncology|endoscopy|cardiac|surgical|"
+                            r"dermatology|urology|outpatients?|hospital|safeguarding|research)\b", re.I)
+
+
+def keyword_hit(job: Job, keyword: str, temporary: bool = False) -> bool:
     """A job title keyword ('care worker', 'locum nurse') must be in the job's TITLE as the whole phrase or a known
     synonym ('carer', 'support worker'); single words from it anywhere in the ad ('care' + 'worker') don't count.
     Skill keywords ('python', 'machine learning') match as whole words anywhere in the ad."""
@@ -89,6 +94,12 @@ def keyword_hit(job: Job, keyword: str) -> bool:
         rest = [w for w in rm.content_words if not any(w in k.split() for k in keys)]
         if rest and all(re.search(rf"\b{re.escape(w)}", title) for w in rest):
             hit = next((f"profile says '{s}'" for s, rx, sc in rm._syn if sc < 2 and rx.search(title)), None)
+    if hit is None and (rm.contract == "temporary" or temporary):
+        # locum / bank searches ('temporary': the search's contract filter is locum / temp, the word was split off) also take the close primary / community nursing titles (locum ANP, bank district nurse)
+        from .candidates.matching import LOCUM_FAMILY, _phrase_re
+        if not _HOSPITAL_ONLY.search(title):   # a locum pre-op / theatre / ward nurse practitioner isn't primary care
+            hit = next((f"profile says '{s}'" for s in LOCUM_FAMILY.get(rm.core, []) if _phrase_re(s).search(title)),
+                       None)
     if hit is None or _not_the_job(title, hit):
         return False
     if rm.contract == "temporary" and not CONTRACT_TEMP.search(f"{hay}\n{job.employment_type or ''}".lower()):
@@ -96,10 +107,11 @@ def keyword_hit(job: Job, keyword: str) -> bool:
     return True
 
 
-def matches(job: Job, keywords: list[str], locations: list[str], remote_uk: bool = False) -> bool:
+def matches(job: Job, keywords: list[str], locations: list[str], remote_uk: bool = False,
+            temporary: bool = False) -> bool:
     if keywords:
         # each keyword is OR'ed
-        if not any(keyword_hit(job, k) for k in keywords if k and k.strip()):
+        if not any(keyword_hit(job, k, temporary) for k in keywords if k and k.strip()):
             return False
     if locations:
         loc = (job.location or "").lower()
@@ -147,6 +159,8 @@ def search(sources: list[str], *, keywords: list[str] = (), locations: list[str]
         contract = inferred
     http = HttpClient(user_agent=user_agent, min_interval=delay)
     kw_hint = kw_hint_raw if kw_hint_raw is not None else (keywords[0] if len(keywords) == 1 else None)
+    if contract == "temporary" and kw_hint and not inferred:
+        kw_hint = f"locum {kw_hint}"   # sources that can ask for locum / bank contracts (NHS Jobs) do so
     loc_hint = locations[0] if len(locations) == 1 and locations[0].lower() != "remote" else None
     cap = max_per_source or None
 
@@ -184,7 +198,7 @@ def search(sources: list[str], *, keywords: list[str] = (), locations: list[str]
                     continue
                 # sources that already searched by distance around the place (NHS Jobs) skip the text place check
                 if not matches(job, keywords, [] if getattr(src, "server_side_location", False) and locations
-                               else locations, remote_uk):
+                               else locations, remote_uk, temporary=contract == "temporary"):
                     continue
                 if salary_only and not (job.salary_min or job.salary_max):
                     continue
@@ -207,6 +221,8 @@ def search(sources: list[str], *, keywords: list[str] = (), locations: list[str]
                 r.status = "error"
         elif r.status == "ok" and r.fetched == 0:
             r.message = "no jobs returned"
+        if getattr(src, "info", None):     # notes that aren't errors (e.g. far-away results dropped)
+            r.message = "; ".join(filter(None, [r.message] + list(src.info)))
         if name == "jsonld" and r.status == "ok" and r.fetched == 0:
             r.message = "no job data found on those pages (the site may not publish schema.org JobPosting data)"
         return r, kept

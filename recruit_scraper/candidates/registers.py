@@ -13,6 +13,14 @@ areas around the search, and the filtered subset cached on disk for 7 days):
 * DfE Get Information About Schools (daily CSV, England)  - schools: phone, website, headteacher's name
 * Charity Commission register extract (England & Wales)   - care / education charities: published email, phone
 * Bar Standards Board register of practising barristers   - chambers address + phone, areas of practice
+* Public Health Scotland open data: GP practices (quarterly CSV, OGL)            - Scottish GP practices + phone
+* HSC Business Services Organisation (NI) practice list ('for professional use') - NI GP practices + phone
+* RQIA register of services (Northern Ireland, xlsx)       - nursing homes, nursing agencies: registered manager, phone
+Each register only runs for the UK nation(s) it covers (CQC / GIAS / enurse: England; ODS epraccur, Charity
+Commission, BSB: England + Wales; Care Inspectorate + PHS: Scotland; BSO + RQIA: Northern Ireland). A whole-UK
+search samples a few of the most contactable rows per postcode area instead of reading everything.
+Not used: Care Inspectorate Wales (no bulk download of its register - only a search page); OpenDataNI's GP file
+(no phone numbers; BSO's list has them).
 Not used: OSCR's register download (its terms forbid direct marketing); CQC registered managers (only in the
 monthly ODS spreadsheet - too heavy to parse on Streamlit Cloud); Companies House bulk data (472 MB zip with no
 phone or email - see README).
@@ -53,6 +61,13 @@ GIAS = "https://ea-edubase-api-prod.azurewebsites.net/edubase/downloads/public/e
 CHARITY_ZIP = "https://ccewuksprdoneregsadata1.blob.core.windows.net/data/txt/publicextract.charity.zip"
 BSB_PAGE = "https://www.barstandardsboard.org.uk/for-the-public/search-a-barristers-record/the-barristers-register.html"
 FSA_API = "https://api.ratings.food.gov.uk/Establishments"
+PHS_GP = "https://www.opendata.nhs.scot/api/3/action/package_show?id=gp-practice-contact-details-and-list-sizes"
+PHS_PAGE = "https://www.opendata.nhs.scot/dataset/gp-practice-contact-details-and-list-sizes"
+BSO_PRACTICES = "https://hscweb.hscni.net/pmp/rptMedicalPracticeList.xlsx"
+BSO_PAGE = ("https://bso.hscni.net/directorates/operations/family-practitioner-services/medical-services/"
+            "contractor-information/northern-ireland-gp-practice-lists-for-professional-use/")
+RQIA_XLSX = "https://www.rqia.org.uk/download/32/services-registered-with-rqia/4452/all-registered-services.xlsx"
+RQIA_PAGE = "https://www.rqia.org.uk/what-we-do/register/"
 
 LICENCES = {
     "CQC": "CQC data (Open Government Licence v3.0)",
@@ -62,7 +77,28 @@ LICENCES = {
     "DfE GIAS": "DfE Get Information about Schools (Open Government Licence v3.0)",
     "Charity Commission": "Charity Commission register of charities (Open Government Licence v3.0)",
     "BSB": "Bar Standards Board Barristers' Register",
+    "PHS": "Public Health Scotland open data (Open Government Licence v3.0)",
+    "HSC BSO": "HSC Business Services Organisation practice list (published for professional use)",
+    "RQIA": "RQIA register of services (Northern Ireland)",
 }
+
+# postcode areas -> UK nation (border areas count for both sides)
+_SCOT = {"AB", "DD", "DG", "EH", "FK", "G", "HS", "IV", "KA", "KW", "KY", "ML", "PA", "PH", "ZE"}
+_WALES = {"CF", "LD", "LL", "NP", "SA"}
+_BORDER = {"TD": {"Scotland", "England"}, "SY": {"England", "Wales"}, "CH": {"England", "Wales"},
+           "HR": {"England", "Wales"}, "GL": {"England", "Wales"}}
+ALL_NATIONS = {"England", "Scotland", "Wales", "Northern Ireland"}
+
+
+def nations_of_area(a: str) -> set[str]:
+    a = (a or "").upper()
+    if a == "BT":
+        return {"Northern Ireland"}
+    if a in _SCOT:
+        return {"Scotland"}
+    if a in _WALES:
+        return {"Wales"}
+    return set(_BORDER.get(a, {"England"}))
 
 
 class RegisterUnavailable(RuntimeError):
@@ -226,6 +262,7 @@ class Register:
     key = ""
     label = ""
     kinds: set[str] = set()
+    nations: set[str] = {"England"}    # which UK nations the register covers
 
     def applies(self, kinds: list[str], title: str) -> bool:
         return bool(self.kinds & set(kinds))
@@ -240,16 +277,20 @@ class Register:
 CQC_TYPES = {"gp": ("Doctors/GPs",), "care_home": ("Residential homes", "Nursing homes"),
              "home_care": ("Homecare agencies", "Supported living", "Shared lives"), "dental": ("Dentist",),
              "hospital": ("Hospital", "Hospice"), "clinic": ("Clinic", "Community services - Nursing",
-                                                              "Community services - Healthcare")}
+                                                              "Community services - Healthcare"),
+             "community": ("Community services - Nursing", "Community services - Healthcare"),
+             "urgent_care": ("Urgent care centres", "Mobile doctors")}
 CQC_LABEL = {"Doctors/GPs": "GP practice", "Residential homes": "Care home", "Nursing homes": "Nursing home",
              "Homecare agencies": "Home care agency", "Supported living": "Supported living service",
              "Shared lives": "Shared lives scheme", "Dentist": "Dental practice", "Hospital": "Hospital",
              "Hospice": "Hospice", "Clinic": "Clinic", "Community services - Nursing": "Community nursing service",
-             "Community services - Healthcare": "Community health service"}
+             "Community services - Healthcare": "Community health service",
+             "Urgent care centres": "Urgent care / walk-in centre", "Mobile doctors": "Out-of-hours GP service"}
 
 
 class CQCDirectory(Register):
-    key, label, kinds = "cqc", "CQC", {"gp", "care_home", "home_care", "dental", "hospital", "clinic"}
+    key, label, kinds = "cqc", "CQC", {"gp", "care_home", "home_care", "dental", "hospital", "clinic", "community",
+                                       "urgent_care"}
 
     def download(self, http, keep, budget):
         url = latest_link(http, CQC_PAGE, r'href="(https://www\.cqc\.org\.uk/system/files/[^"]+CQC_directory\.csv)"')
@@ -280,7 +321,9 @@ class CQCDirectory(Register):
 
 
 class CareInspectorate(Register):
-    key, label, kinds = "careinsp", "Care Inspectorate", {"care_home", "home_care", "hospital", "clinic", "gp"}
+    key, label, kinds = "careinsp", "Care Inspectorate", {"care_home", "home_care", "hospital", "clinic",
+                                                          "nurse_agency"}
+    nations = {"Scotland"}
 
     def download(self, http, keep, budget):
         url = ci_latest_csv(http)
@@ -313,11 +356,14 @@ class CareInspectorate(Register):
         nurse = re.search(r"\bnurs|\brgn\b|\brmn\b", title, re.I)
         return (("care_home" in kinds and t.startswith("Care Home Service"))
                 or ("home_care" in kinds and (t.startswith("Housing Support") or "Care at Home" in t))
-                or (bool(nurse) and (t.startswith("Nurse Agency") or t.startswith("Care Home Service|Older"))))
+                or ("nurse_agency" in kinds and t.startswith("Nurse Agency"))
+                or (bool(nurse) and "gp" not in kinds and (t.startswith("Nurse Agency")
+                                                          or t.startswith("Care Home Service|Older"))))
 
 
 class ODSPractices(Register):
     key, label, kinds = "epraccur", "NHS ODS", {"gp"}
+    nations = {"England", "Wales"}
 
     def download(self, http, keep, budget):
         for row in stream_csv(http, ODS_REPORT + "epraccur", budget, encoding="cp1252"):
@@ -426,6 +472,7 @@ _CARE_CHARITY = re.compile(r"\b(care home|nursing home|residential care|home car
 class CharityRegister(Register):
     # care charities only: for schools, GIAS is better, and a charity's registered contact is often its accountant
     key, label, kinds = "charities", "Charity Commission", {"care_home", "home_care"}
+    nations = {"England", "Wales"}
 
     def download(self, http, keep, budget):
         header = None
@@ -457,6 +504,7 @@ class CharityRegister(Register):
 
 class BarristersRegister(Register):
     key, label, kinds = "bsb", "BSB", {"barristers"}
+    nations = {"England", "Wales"}
 
     def download(self, http, keep, budget):
         url = latest_link(http, BSB_PAGE, r'href="(https://www\.barstandardsboard\.org\.uk/asset/[^"]+)"\s+download')
@@ -485,8 +533,122 @@ class BarristersRegister(Register):
         return not m or m.group(1)[:5].lower() in row.tags.lower()
 
 
-REGISTERS: list[Register] = [CQCDirectory(), CareInspectorate(), ODSPractices(), ODSNursePrescribers(),
-                             GIASSchools(), CharityRegister(), BarristersRegister()]
+def read_xlsx(http: HttpClient, url: str, budget: _Budget, max_bytes: int = 20 * 1024 * 1024) -> list[tuple]:
+    """A small official spreadsheet (a few hundred KB): downloaded with a size cap, every row as a tuple."""
+    import openpyxl
+    import warnings
+    buf = io.BytesIO()
+    try:
+        with http.session.get(url, stream=True, timeout=(15, 30)) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(1 << 16):
+                buf.write(chunk)
+                if buf.tell() > max_bytes:
+                    raise RegisterUnavailable("file larger than expected - skipped")
+                budget.check()
+    except requests.RequestException as e:
+        raise RegisterUnavailable(type(e).__name__) from e
+    buf.seek(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            wb = openpyxl.load_workbook(buf, read_only=True, data_only=True)
+        except Exception as e:  # noqa: BLE001 - not a spreadsheet (an error page)
+            raise RegisterUnavailable("not a spreadsheet") from e
+        ws = wb.active
+        ws.reset_dimensions()         # these files carry a wrong 'A1' dimension
+        rows = [tuple("" if v is None else str(v).strip() for v in row) for row in ws.iter_rows(values_only=True)]
+        wb.close()
+    return rows
+
+
+def _header_rows(rows: list[tuple], first: str) -> Iterator[Callable[[str], str]]:
+    """Rows after the header row whose first cell is `first`, as column-name getters."""
+    header = None
+    for row in rows:
+        if header is None:
+            if row and row[0] == first:
+                header = {h: i for i, h in enumerate(row) if h}
+            continue
+        yield (lambda r: (lambda h: r[header[h]] if h in header and header[h] < len(r) else ""))(row)
+
+
+class PHSScotlandPractices(Register):
+    """Every GP practice in Scotland with its phone (Public Health Scotland open data, OGL, quarterly)."""
+    key, label, kinds = "phs_gp", "PHS", {"gp"}
+    nations = {"Scotland"}
+
+    def download(self, http, keep, budget):
+        try:
+            res = http.get_json(PHS_GP)["result"]["resources"]
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+            raise RegisterUnavailable(type(e).__name__) from e
+        url = max(res, key=lambda x: x.get("created") or "")["url"]   # the newest quarter
+        header = None
+        for row in stream_csv(http, url, budget):
+            if header is None:
+                header = {h: i for i, h in enumerate(row)}
+                continue
+            g = lambda h: row[header[h]].strip() if h in header and header[h] < len(row) else ""
+            pc = pc_norm(g("Postcode"))
+            if not keep(outcode(pc)):
+                continue
+            yield RegRow(name=_title(g("GPPracticeName")), employer_type="GP practice", postcode=pc,
+                         address=", ".join(_title(g(f"AddressLine{i}")) for i in range(1, 5) if g(f"AddressLine{i}")),
+                         phone=g("TelephoneNumber"), ods_code=g("PracticeCode"), source="PHS",
+                         source_url=f"{PHS_PAGE}#{g('PracticeCode')}", tags=g("GPCluster"))
+
+
+class NIPractices(Register):
+    """Every GP practice in Northern Ireland with its phone (HSC Business Services Organisation's practice list,
+    published 'for people or organisations looking to create address labels' - i.e. to contact practices)."""
+    key, label, kinds = "bso_gp", "HSC BSO", {"gp"}
+    nations = {"Northern Ireland"}
+
+    def download(self, http, keep, budget):
+        for g in _header_rows(read_xlsx(http, BSO_PRACTICES, budget), "PracNo"):
+            pc = pc_norm(g("Postcode"))
+            if not pc or not keep(outcode(pc)):
+                continue
+            name = g("practiceName") or g("PartnershipName")
+            yield RegRow(name=_title(name), employer_type="GP practice", postcode=pc,
+                         address=", ".join(_title(g(f"Address{i}")) for i in range(1, 5)
+                                           if g(f"Address{i}") and g(f"Address{i}") != name),
+                         phone=g("TelNo"), ods_code=g("PartnershipNo"), source="HSC BSO",
+                         source_url=f"{BSO_PAGE}#{g('PracNo')}", tags=g("LCG"))
+
+
+class RQIARegister(Register):
+    """Northern Ireland's register of care services (RQIA): nursing homes and nursing agencies with the
+    registered manager named by the regulator."""
+    key, label, kinds = "rqia", "RQIA", {"care_home", "home_care", "nurse_agency"}
+    nations = {"Northern Ireland"}
+
+    def download(self, http, keep, budget):
+        for g in _header_rows(read_xlsx(http, RQIA_XLSX, budget), "Service ID"):
+            pc = pc_norm(g("Postcode"))
+            if not pc or not keep(outcode(pc)) or not pc.startswith("BT"):
+                continue      # a few agencies are registered from Dublin / GB offices
+            cat = g("Category")
+            label = re.sub(r"\s*\([A-Z]+\)", "", cat).strip() or "Care service"
+            label = {"Nursing": "Nursing home", "Residential": "Residential care home"}.get(label, label)
+            yield RegRow(name=g("Service"), employer_type=label, postcode=pc,
+                         address=", ".join(filter(None, [g("Address Line1"), g("Address Line2"), g("Town")])),
+                         phone=g("Phone"), contact_name=_person(g("Manager")),
+                         contact_role="Registered manager (RQIA)" if g("Manager") else "", source="RQIA",
+                         source_url=f"{RQIA_PAGE}#{g('Service ID')}", tags=cat)
+
+    def wanted(self, row, kinds, title):
+        t = row.tags
+        nurse = bool(re.search(r"\bnurs|\brgn\b|\brmn\b", title, re.I))
+        return (("nurse_agency" in kinds and t.startswith("Nursing Agency"))
+                or ("care_home" in kinds and (t.startswith("Nursing (") or (not nurse and t.startswith("Residential"))))
+                or ("home_care" in kinds and t.startswith("Domiciliary Care")))
+
+
+REGISTERS: list[Register] = [CQCDirectory(), CareInspectorate(), ODSPractices(), PHSScotlandPractices(),
+                             NIPractices(), RQIARegister(), ODSNursePrescribers(), GIASSchools(), CharityRegister(),
+                             BarristersRegister()]
 FALLBACKS = {"cqc": ODSCareHomes()}
 
 FSA_TYPES = {1: "Restaurant / cafe / canteen", 7843: "Pub / bar / nightclub", 7842: "Hotel / B&B",
@@ -494,6 +656,21 @@ FSA_TYPES = {1: "Restaurant / cafe / canteen", 7843: "Pub / bar / nightclub", 78
 
 
 # --- the finder ----------------------------------------------------------------------------------------------
+
+def uk_bucket(oc: str) -> str:
+    """Sampling unit for a whole-UK search: the postcode area ('M', 'G'); Northern Ireland is one area (BT) with
+    ~3% of the UK, so it is split by district group (BT1-9, BT2x … BT9x) to be fairly represented."""
+    a = area(oc)
+    if a == "BT":
+        d = re.sub(r"\D", "", oc)
+        return f"BT{d[0] if len(d) == 2 else '0'}" if d else "BT"
+    return a
+
+
+def contact_score(r) -> int:
+    """How reachable a row is: email > website > phone (+ a named contact)."""
+    return 4 * bool(r.email) + 2 * bool(r.website) + 2 * bool(r.phone) + bool(r.contact_name)
+
 
 @dataclass
 class RegistersFinder:
@@ -507,6 +684,40 @@ class RegistersFinder:
     def __post_init__(self):
         self.http = self.http or HttpClient(min_interval=1.0, timeout=30, retries=1, backoff=2)
         self.cache = DiskCache("registers", TTL)
+
+    per_area_uk: int = 3           # whole-UK search: rows kept per postcode area (most contactable first)
+
+    def sample_uk(self, reg: Register, budget: _Budget, want: Callable[[RegRow], bool] = lambda r: True,
+                  key: str = "") -> list[RegRow]:
+        """Whole-UK search: one streamed pass keeping the few most contactable rows of each postcode area (so every
+        region and nation is represented and memory stays small). Cached for 7 days."""
+        ck = f"{reg.key}:UK3-{self.per_area_uk}:{key}"
+        hit = self.cache.get(ck)
+        if hit is not None:
+            return [RegRow(**r) for r in hit]
+        best: dict[str, list[RegRow]] = {}
+        n_named: dict[str, int] = {}
+        for r in reg.download(self.http, lambda oc: True, budget):
+            a = uk_bucket(outcode(r.postcode))
+            if not a or not want(r):
+                continue
+            if r.named_person:      # named people: the first few per area (register order spreads them out)
+                if n_named.get(a, 0) < self.per_area_uk:
+                    n_named[a] = n_named.get(a, 0) + 1
+                    best.setdefault(f"{a}|named", []).append(r)
+                continue
+            lst = best.setdefault(f"{a}|{r.employer_type}", [])   # every kind of employer in every area
+            lst.append(r)
+            if len(lst) > self.per_area_uk * 4:   # keep memory flat: trim to the most contactable
+                lst.sort(key=contact_score, reverse=True)
+                del lst[self.per_area_uk * 2:]
+        out = []
+        for lst in best.values():
+            named = [r for r in lst if r.named_person]
+            rest = sorted([r for r in lst if not r.named_person], key=contact_score, reverse=True)[: self.per_area_uk * 2]
+            out += rest + named
+        self.cache.set(ck, [r.to_dict() for r in out])
+        return out
 
     def subset(self, reg: Register, wanted_outcodes: set[str], budget: _Budget) -> list[RegRow]:
         """Rows in the wanted postcode areas: from the 7-day cache, else one streamed pass over the register."""
@@ -559,14 +770,20 @@ class RegistersFinder:
                                   tags=f"hygiene rating {e.get('RatingValue')}"))
         return out
 
-    def find(self, kinds: list[str], title: str, place: Place, radius: float, wanted_outcodes: list[str],
+    def find(self, kinds: list[str], title: str, place: Place, radius: float, wanted_outcodes: Optional[list[str]],
              geocode: Callable[[list[str]], dict], progress: Callable[[str], None] = lambda m: None) -> list[RegRow]:
         total = _Budget(self.total_budget)
+        uk = bool(getattr(place, "nationwide", False)) or wanted_outcodes is None
+        wanted_outcodes = list(wanted_outcodes or [])
         rank = {o: i for i, o in enumerate(wanted_outcodes)}
         wanted = set(wanted_outcodes)
         out: list[RegRow] = []
-        todo = [r for r in REGISTERS if r.applies(kinds, title)]
-        if "food" in kinds:
+        # only the registers for the UK nation(s) the search area is in (Glasgow: no CQC; Belfast: BSO + RQIA)
+        nations = ALL_NATIONS if uk else ({n for o in wanted for n in nations_of_area(area(o))}
+                                          | ({place.country} & ALL_NATIONS))
+        todo = [r for r in REGISTERS if r.applies(kinds, title) and r.nations & nations]
+        self.stats["nations"] = ", ".join(sorted(nations))
+        if "food" in kinds and not uk:
             progress("Food Standards Agency: restaurants, pubs and hotels near the postcode…")
             try:
                 rows = self.fsa(place, radius, total)
@@ -584,8 +801,11 @@ class RegistersFinder:
                     break
                 try:
                     budget = _Budget(min(DOWNLOAD_BUDGET, max(5.0, total.end - time.monotonic())))
-                    rows = [r for r in self.subset(attempt, wanted, budget) if attempt.wanted(r, kinds, title)]
-                    rows.sort(key=lambda r: rank.get(outcode(r.postcode), 999))
+                    got = (self.sample_uk(attempt, budget, lambda r: attempt.wanted(r, kinds, title),
+                                          f"{'-'.join(sorted(kinds))}:{title.lower().strip()}") if uk
+                           else self.subset(attempt, wanted, budget))
+                    rows = [r for r in got if attempt.wanted(r, kinds, title)]
+                    rows.sort(key=lambda r: (-contact_score(r), r.postcode) if uk else rank.get(outcode(r.postcode), 999))
                     self.stats[attempt.key] = len(rows)
                     return rows[: self.max_rows]
                 except (RegisterUnavailable, requests.RequestException, zipfile.BadZipFile, OSError, csv.Error) as e:
@@ -599,14 +819,15 @@ class RegistersFinder:
                 for rows in pool.map(one, todo):
                     out += rows
         need = [r.postcode for r in out if r.lat is None and r.postcode]
-        coords = geocode(need) if need else {}
+        coords = geocode(need) if need and not uk else {}   # whole UK: distance from the middle means nothing
         kept = []
         for r in out:
             if r.lat is None:
                 co = coords.get(re.sub(r"\s+", "", r.postcode.upper()))
                 if co:
                     r.lat, r.lon = co
-            r.distance = round(haversine_miles(place.lat, place.lon, r.lat, r.lon), 1) if r.lat is not None else None
+            r.distance = (round(haversine_miles(place.lat, place.lon, r.lat, r.lon), 1)
+                          if r.lat is not None and not uk else None)
             if r.distance is not None and r.distance > radius:
                 continue
             kept.append(r)

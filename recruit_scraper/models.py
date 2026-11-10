@@ -27,6 +27,8 @@ class Job:
     remote: Optional[bool] = None
     contact_email: Optional[str] = None  # only if published in the posting itself
     contact_phone: Optional[str] = None  # only if published in the posting itself
+    closing_date: Optional[str] = None   # ISO date the advert closes, where the source publishes it
+    hours: Optional[str] = None          # hours / sessions as written ('2 sessions a week', '37.5 hours', 'Bank')
     scraped_at: str = field(default_factory=_now)
 
     def to_dict(self) -> dict:

@@ -200,7 +200,7 @@ def jobs_page():
     c1, c2 = st.columns(2)
     c1.text_input("Job keywords", placeholder="e.g. data engineer, product manager", key="j_keywords",
                   help="Separate alternatives with commas. Words in one phrase must all appear.")
-    c2.text_input("Location", placeholder="e.g. London, Manchester, remote", key="j_location",
+    c2.text_input("Location", placeholder="e.g. London, Glasgow, remote, or UK", key="j_location",
                   help="Separate alternatives with commas. 'remote' also matches remote jobs.")
 
     n_companies = len(lines(st.session_state["companies_text"]))
@@ -368,7 +368,8 @@ def show_job_results() -> None:
     else:
         st.caption("Click a column header to sort · tick a row's box to read the full ad below · "
                    "hover the table for 🔍 search and ⬇ quick download.")
-        cols = ["title", "url", "company", "location", "salary", "posted_date", "employment_type", "remote"]
+        cols = ["title", "url", "company", "location", "salary", "employment_type", "hours", "closing_date",
+                "posted_date", "remote"]
         if not hide_contacts:
             cols += ["contact_email", "contact_phone"]
         cols += ["where_found"]
@@ -382,6 +383,8 @@ def show_job_results() -> None:
                 "salary": "Salary",
                 "posted_date": st.column_config.DateColumn("Posted", format="D MMM YYYY"),
                 "employment_type": "Type", "remote": "Remote", "where_found": "Found on",
+                "hours": st.column_config.TextColumn("Hours / sessions", width="small"),
+                "closing_date": st.column_config.DateColumn("Closes", format="D MMM YYYY"),
                 "contact_email": st.column_config.TextColumn("Contact email", width="large"),
                 "contact_phone": st.column_config.TextColumn("Contact phone", width="medium"),
             })
@@ -393,7 +396,9 @@ def show_job_results() -> None:
                 st.markdown(f"#### 📄 {row['title']} — {row['company']}")
                 a, b, c, d = st.columns(4)
                 a.markdown(f"**Location:** {row['location'] or '—'}")
-                b.markdown(f"**Salary:** {row['salary'] or 'not stated'}")
+                b.markdown(f"**Pay:** {row['salary'] or row.get('salary_raw') or 'not stated'}"
+                           + (f" · {row['hours']}" if row.get("hours") else "")
+                           + (f" · closes {row['closing_date']}" if pd.notna(row.get("closing_date")) else ""))
                 c.markdown(f"**Posted:** {row['posted_date'] if pd.notna(row['posted_date']) else '—'}")
                 if not hide_contacts and (row["contact_email"] or row["contact_phone"]):
                     d.markdown(f"**Contact:** {row['contact_email']} {row['contact_phone']}")

@@ -240,7 +240,9 @@ def candidates_page():
 
     c1, c2 = st.columns([2, 1])
     c1.text_input("Job title / skills", placeholder="e.g. electrician, accountant, care worker, python developer", key="c_title")
-    c2.text_input("UK postcode", placeholder="e.g. M1 1AE", key="c_postcode")
+    c2.text_input("UK postcode", placeholder="e.g. M1 1AE, or UK for the whole UK", key="c_postcode",
+                  help="A postcode (G1 1XQ, BT1 5GS, CF10 1EP, TR1 2HE …) or 'UK' to search England, Scotland, Wales "
+                       "and Northern Ireland at once (no radius; a sample of the most contactable employers per area).")
     c3, c4, c5 = st.columns(3)
     c3.slider("Radius (miles)", 1, 50, key="c_radius",
               help="Nearby areas are taken from about 15 miles around; distance is then checked against your radius.")
@@ -300,7 +302,9 @@ def candidates_page():
                 job_sources=["remotive", "arbeitnow", "remoteok", "himalayas", "jobicy"],
                 companies=[l.strip() for l in ss.get("companies_text", "").splitlines() if l.strip()])
             radius, retention = float(ss["c_radius"]), int(ss["c_retention"])
-            label = f"'{title}' within {ss['c_radius']} miles of {postcode.upper()}"
+            from recruit_scraper.candidates.geo import is_nationwide
+            label = (f"'{title}' across the whole UK" if is_nationwide(postcode)
+                     else f"'{title}' within {ss['c_radius']} miles of {postcode.upper()}")
 
             def run(t):
                 t.purged = purge_old_exports(retention)

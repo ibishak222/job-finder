@@ -18,17 +18,31 @@ SYNONYMS: dict[str, list[str]] = {
               "psychiatric nurse", "learning disability nurse", "theatre nurse", "scrub nurse", "icu nurse",
               "itu nurse", "critical care nurse", "a&e nurse", "emergency nurse", "practice nurse", "district nurse",
               "community nurse", "nurse practitioner", "anp", "ward sister", "charge nurse", "nurse manager",
-              "paediatric nurse", "rsc nurse", "midwife", "nursing associate"],
+              "paediatric nurse", "rsc nurse", "nursing associate", "general practice nurse", "gpn",
+              "treatment room nurse", "advanced nurse practitioner", "nurse prescriber", "registered general nurse",
+              "nmc registered", "bank nurse", "agency nurse", "locum nurse"],
     "registered nurse": ["rgn", "rmn", "rnld", "staff nurse", "nurse"],
     "mental health nurse": ["rmn", "psychiatric nurse", "cpn", "community psychiatric nurse", "mental health nursing"],
     "learning disability nurse": ["rnld", "ld nurse"],
     "theatre nurse": ["scrub nurse", "anaesthetic nurse", "recovery nurse", "perioperative", "odp"],
     "icu nurse": ["itu nurse", "critical care nurse", "intensive care nurse"],
     "a&e nurse": ["emergency nurse", "ed nurse", "emergency department nurse"],
-    "practice nurse": ["gp nurse", "general practice nurse"],
-    "district nurse": ["community nurse", "community nursing"],
+    # primary care nursing: the same job under the names GP surgeries, PCNs and nurses themselves use
+    "practice nurse": ["general practice nurse", "gp nurse", "gpn", "treatment room nurse", "primary care nurse",
+                       "practice nursing", "gp practice nurse", "surgery nurse"],
+    "general practice nurse": ["practice nurse", "gp nurse", "gpn", "treatment room nurse", "primary care nurse"],
+    "treatment room nurse": ["practice nurse", "general practice nurse", "gp nurse", "gpn"],
+    "advanced nurse practitioner": ["anp", "nurse practitioner", "advanced clinical practitioner",
+                                    "advanced practice nurse", "advanced nurse practitioners"],
+    "anp": ["advanced nurse practitioner", "nurse practitioner", "advanced clinical practitioner"],
+    "nurse practitioner": ["anp", "advanced nurse practitioner", "advanced clinical practitioner",
+                           "advanced practice nurse"],
+    "district nurse": ["community nurse", "community nursing", "district nursing", "district nursing sister",
+                       "community staff nurse"],
+    "community nurse": ["district nurse", "community nursing", "district nursing", "community staff nurse"],
     "healthcare assistant": ["hca", "health care assistant", "nursing assistant", "care assistant", "clinical support worker",
-                             "healthcare support worker"],
+                             "healthcare support worker", "health care support worker", "hcsw"],
+    "hca": ["healthcare assistant", "health care assistant", "healthcare support worker", "hcsw"],
     "electrician": ["electrical contractor", "electrical installer", "electrical engineer", "sparky", "sparkie",
                     "electrical installation", "approved electrician", "niceic", "electrical apprentice"],
     "plumber": ["plumbing", "heating engineer", "gas engineer", "gas safe", "plumbing and heating"],
@@ -87,6 +101,37 @@ SYNONYMS: dict[str, list[str]] = {
     "it support": ["helpdesk", "help desk", "service desk", "it technician", "desktop support", "1st line",
                    "2nd line"],
 }
+# close-but-not-identical jobs a recruiter would still want to see (scored like 'related', below exact synonyms):
+# a GP surgery hiring a practice nurse also wants nurse prescribers, chronic-disease / screening nurses, ANPs
+_PN_RELATED = ["nurse practitioner", "advanced nurse practitioner", "anp", "nurse prescriber", "independent prescriber",
+               "non-medical prescriber", "chronic disease nurse", "long term conditions nurse", "respiratory nurse",
+               "diabetes nurse", "diabetes specialist nurse", "asthma nurse", "copd nurse", "travel health nurse",
+               "immunisation nurse", "sexual health nurse", "smear taker", "cervical sample taker", "cervical screening"]
+RELATED: dict[str, list[str]] = {
+    "practice nurse": _PN_RELATED,
+    "general practice nurse": _PN_RELATED,
+    "treatment room nurse": _PN_RELATED,
+    "advanced nurse practitioner": ["nurse prescriber", "independent prescriber", "practice nurse", "paramedic practitioner"],
+    "nurse practitioner": ["nurse prescriber", "independent prescriber", "practice nurse"],
+    "healthcare assistant": ["phlebotomist", "phlebotomy", "health care support worker"],
+    "hca": ["phlebotomist", "phlebotomy", "nursing assistant"],
+    "district nurse": ["community matron", "specialist practitioner district nursing", "community nursing sister"],
+    "community nurse": ["community matron", "district nursing sister"],
+}
+# a LOCUM / bank search for one of these titles also takes vacancies for the close primary / community nursing jobs
+# (locum ANP, bank district nurse, sessional immunisation nurse): locum work is advertised under many names
+LOCUM_FAMILY: dict[str, list[str]] = {
+    "practice nurse": _PN_RELATED + ["district nurse", "community nurse", "community staff nurse", "community matron",
+                                     "advanced clinical practitioner", "vaccinator",
+                                     "minor injuries nurse", "urgent care nurse", "walk-in centre nurse",
+                                     "out of hours nurse"],
+}
+LOCUM_FAMILY["general practice nurse"] = LOCUM_FAMILY["treatment room nurse"] = LOCUM_FAMILY["practice nurse"]
+LOCUM_FAMILY["nurse practitioner"] = LOCUM_FAMILY["advanced nurse practitioner"] = [
+    "advanced clinical practitioner", "practice nurse", "general practice nurse", "nurse prescriber", "urgent care nurse"]
+LOCUM_FAMILY["district nurse"] = LOCUM_FAMILY["community nurse"] = [
+    "district nurse", "community nurse", "community staff nurse", "community matron", "district nursing",
+    "community nursing", "practice nurse"]
 # words that say nothing about the job on their own (never enough for a match)
 GENERIC = {"senior", "junior", "lead", "head", "principal", "trainee", "apprentice", "graduate", "intern", "chief",
            "assistant", "manager", "officer", "worker", "engineer", "specialist", "consultant", "executive",
@@ -146,7 +191,7 @@ class RoleMatcher:
         self.core = core or t
         self.tech = is_tech_role(t)
         exact: list[str] = []
-        related: list[str] = []
+        related: list[str] = list(RELATED.get(self.core, []))
         for key, alts in SYNONYMS.items():
             if key == self.core:
                 exact += [a for a in alts if a != self.core]
@@ -183,20 +228,24 @@ class RoleMatcher:
         cands = ([(3.0, self.core, self._exact)] if self._exact is not None else []) + [(sc, s, rx) for s, rx, sc in self._syn]
         for sc, s, rx in cands:
             if (mm := rx.search(text)) and not _not_the_job(text, f"profile says '{s}'"):
-                hit = (sc, f"profile says '{s}'", mm.start())
+                hit = (sc, f"profile says '{s}'", mm.start(), mm.end())
                 break
         if hit is None:
             if len(self.content_words) >= 2 and all(rx.search(text) for rx in self._words):
-                hit = (1.5, "profile mentions " + " + ".join(f"'{w}'" for w in self.content_words), -1)
+                hit = (1.5, "profile mentions " + " + ".join(f"'{w}'" for w in self.content_words), -1, -1)
             else:
                 return Match()
-        score, reason, pos = hit
+        score, reason, pos, end = hit
         if pos < 0 and _not_the_job(text, reason):
             return Match()
         ctx = text[max(0, pos - 45):pos] if pos >= 0 else ""
         fm = _FORMER.search(ctx)
         if fm and not re.search(r"\b(now|currently|today)\b", ctx[fm.start():]):
             return Match()  # "retired accountant", "former electrician", "ex-nurse": not a current match
+        if pos >= 0 and _ASPIRING.search(text[max(0, pos - 40):pos]):
+            return Match()  # "aspiring to become a general practice nurse", "student nurse hoping to be a GPN"
+        if end >= 0 and _FORMER_AFTER.match(text[end:end + 60]):
+            return Match()  # "GP practice nurse before", "nurse (retired)", "nurse in a past life"
         if _ORG.search(text) and not _PERSON.search(text):
             score, reason = score - 0.5, reason + " (looks like a business/organisation account)"
         return Match(score, reason)
@@ -241,6 +290,10 @@ def _not_the_job(text: str, reason: str) -> bool:
 
 _FORMER = re.compile(r"\b(retired|former(ly)?|ex|failed|recovering|recovered|used to be|one-?time|previous life|past life)\b[\s\-,]*([\w/&\-]+[\s,]+){0,3}$",
                      re.I)
+_ASPIRING = re.compile(r"\b(aspiring|aspire|aspires|hoping to|hope to|want(s|ing)? to|would like to|dream(s|ing)? of|"
+                       r"working towards|on my way to|future)\b[\w\s\-]{0,25}$", re.I)
+_FORMER_AFTER = re.compile(r"^\W{0,3}(\(?retired\)?|before\b|previously\b|formerly\b|in (a|my) (past|previous|former) "
+                           r"(life|career)|until (19|20)\d\d|for \d+ years,? (now|then) )", re.I)
 _ORG = re.compile(r"^\W*(we|our)\b|\b(we are|we provide|we offer|we specialise|our team|contact us|call us|"
                   r"get in touch with us|services ltd|official account)\b", re.I)
 _PERSON = re.compile(r"\b(i|i'm|im|my|me|he/him|she/her|they/them)\b", re.I)
@@ -250,7 +303,7 @@ _BIZ_NAME = re.compile(r"\b(ltd|limited|llp|plc|cic|inc|services|solutions|group
                        r"electricians|plumbers|accountants|solicitors|builders|roofers|carers|recruitment|consultancy|"
                        r"news|journal|magazine|podcast|official|council|charity|association|society|network|"
                        r"foundation|trust|union|federation|institute|uk|university|college|hospital|hospice|library|"
-                       r"museum)\b", re.I)
+                       r"museum|chambers|surgery|pcn|medical (centre|center|practice|group)|health centre)\b", re.I)
 # bios of publications / institutions written in the third person ('Practice Nurse journal is designed to…')
 _INST_BIO = re.compile(r"^\W*(the\s+)?[\w\s&'’-]{0,60}\b(journal|magazine|publication|newsletter|podcast|university|"
                        r"college|institution|organisation|organization)\b[^.]{0,40}\b(is|are|publishes|provides)\b|\b(one of the uk'?s|official account|posting weekdays|is designed to|"
@@ -260,7 +313,7 @@ _BIZ_BIO = re.compile(r"\b(provides?|delivers?|offering|we('re| are| provide| of
                       r"chartered|family[- ]run|local|trusted|uk)[\w\s,&-]{0,40}(firm|company|practice|business|charity|"
                       r"organisation|organization|provider|agency|union|journal)|firm of|charity for|journal of|"
                       r"official (account|journal)|registered charity|company number|tel:|call us|ltd|limited|llp|"
-                      r"book (now|online|"
+                      r"join our|book (now|online|"
                       r"a free)|free quote)\b", re.I)
 
 
@@ -277,7 +330,7 @@ def looks_like_business(name: str, bio: str) -> bool:
                                                       b, re.I)
 
 
-CONTRACT_TEMP = re.compile(r"\b(locum|agency|bank (nurse|staff|shifts?|work)|bank|temp|temporary|contract(or|ing)?|"
+CONTRACT_TEMP = re.compile(r"\b(locum|sessional|flexi ?pool|agency|bank (nurse|staff|shifts?|work)|bank|temp|temporary|contract(or|ing)?|"
                            r"freelance|interim|fixed[- ]term|zero[- ]hours?|ad[- ]hoc|self[- ]employed|sole trader)\b", re.I)
 CONTRACT_PERM = re.compile(r"\b(permanent|perm\b|full[- ]time|salaried|substantive)", re.I)
 
@@ -304,6 +357,9 @@ def years_from_text(text: str) -> Optional[float]:
 def place_terms(place) -> list[str]:
     """Names a person in this area would write in their bio: districts, metro names, the region if it's London."""
     from .providers import location_variants
+    if getattr(place, "nationwide", False):   # whole-UK search: any UK town / nation counts as 'in the area'
+        from .geo import UK_TOWNS
+        return list(dict.fromkeys(list(UK_TOWNS) + ["England", "Scotland", "Wales", "Northern Ireland", "Cymru"]))
     out = location_variants(place, 15)
     extra = [place.town]
     if (place.region or "").lower() == "london":

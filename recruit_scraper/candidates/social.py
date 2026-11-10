@@ -118,6 +118,15 @@ def own_site(urls: list[str]) -> str:
     return ""
 
 
+_FAMILIES = ("nurse", "carer", "teacher", "solicitor", "accountant", "chef", "electrician", "plumber", "driver")
+
+
+def _family(core: str) -> str:
+    """The one-word job family of a longer title: 'practice nurse' -> 'nurse' ('' when the title is the family)."""
+    words = (core or "").split()
+    return next((f for f in _FAMILIES if len(words) > 1 and words[-1] in (f, f + "s")), "")
+
+
 class _BioProvider:
     name = "bio"
     label = ""
@@ -153,8 +162,18 @@ class _BioProvider:
         areas = [place.town] + (["London"] if (place.region or "").lower() == "london" else [])
         areas += list(place.nearby_towns or [])[: max(0, self.n_areas - 1)]
         areas = [re.sub(r",.*$", "", a) for a in dict.fromkeys(a for a in areas if a)][: max(1, self.n_areas + 1)]
+        if getattr(place, "nationwide", False):
+            areas = ["UK"]   # a whole-UK search: the job + 'UK', then the job on its own (UK location checked later)
         qs = [f"{t} {a}" for t in terms[:2] for a in areas[:2]] + terms[:self.n_terms]
         qs += [f"{t} {a}" for a in areas[2:] for t in terms[:1]] + [f"{t} {a}" for t in terms[2:3] for a in areas[:1]]
+        # the wider job family near them ('nurse Leeds' finds the practice nurses who just write 'nurse, Leeds')
+        fam = _family(matcher.core)
+        if fam:
+            qs.insert(min(len(qs), 3), f"{fam} {areas[0]}")
+        if matcher.contract == "temporary":
+            # locum / bank work is how temporary staff describe themselves: search those words first
+            lq = [f"locum {matcher.core}", f"bank {fam or matcher.core}", f"locum {fam or matcher.core} {areas[0]}"]
+            qs = lq + qs
         return list(dict.fromkeys(qs))[: self.max_queries]
 
     def _collect(self, qs: list[str], progress) -> dict[str, dict]:
@@ -232,6 +251,11 @@ class _BioProvider:
                 # area names are district-level, so allow a little slack beyond the radius
                 if dist is not None and dist > radius_miles + 3:
                     continue
+                if getattr(place, "nationwide", False):
+                    dist = None       # a whole-UK search: distance from the middle of the country means nothing
+            elif getattr(place, "nationwide", False) and (p.get("uk_hint") or UK_SIGNAL.search(
+                    _URL.sub(" ", re.sub(r"(?i)new england", "", text)))) and not ABROAD.search(_URL.sub(" ", text)):
+                area = "UK"           # whole-UK search: 'UK-based' is exactly what was asked for
             elif self.uk_unknown and (p.get("uk_hint") or UK_SIGNAL.search(_URL.sub(" ", re.sub(r"(?i)new england",
                                                                                                 "", text)))):
                 if far_uk_place(text, place, radius_miles, geocoder) or ABROAD.search(_URL.sub(" ", text)):

@@ -141,7 +141,8 @@ _EMP_MAP = {
     "temporary": "temporary", "temp": "temporary", "fixed term": "fixed-term", "befristeter arbeitsvertrag": "fixed-term",
     "permanent": "permanent", "unbefristeter arbeitsvertrag": "permanent", "permanent employment": "permanent",
     "intern": "internship", "internship": "internship", "praktikum": "internship",
-    "locum": "locum", "bank": "bank", "agency": "agency", "secondment": "fixed-term", "zero hours": "temporary",
+    "locum": "locum", "bank": "bank", "agency": "agency", "sessional": "sessional", "ad hoc": "temporary",
+    "flexi pool": "bank", "flexipool": "bank", "secondment": "fixed-term", "zero hours": "temporary",
     "werkstudent": "working student", "ausbildung": "apprenticeship", "apprenticeship": "apprenticeship",
 }
 
@@ -166,8 +167,8 @@ def normalise_employment_type(value: Any) -> Optional[str]:
     return ", ".join(out) or None
 
 
-TEMP_TYPES = {"locum", "bank", "agency", "temporary", "contract", "fixed-term", "freelance"}
-_AD_TEMP = re.compile(r"\b(locum|bank (?:staff|nurse|shifts?|worker|hca|role|position)|agency (?:nurse|staff|worker)|"
+TEMP_TYPES = {"locum", "bank", "agency", "temporary", "contract", "fixed-term", "freelance", "sessional"}
+_AD_TEMP = re.compile(r"\b(locum|sessional|ad[- ]hoc (?:sessions?|shifts?|basis)|bank (?:staff|nurse|shifts?|worker|hca|role|position)|agency (?:nurse|staff|worker)|"
                       r"temporary (?:role|position|contract|post)|fixed[- ]term|contract role|(?:\d+|six|three|twelve)"
                       r"[- ](?:month|week) contract|freelance)\b", re.I)
 _AD_PERM = re.compile(r"\b(permanent (?:role|position|post|contract|basis|job)|this is a permanent)\b", re.I)
