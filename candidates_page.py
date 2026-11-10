@@ -27,9 +27,12 @@ GDPR_TEXT = """
   unsolicited emails to users, naming recruiters and headhunters. An email shown for a GitHub person was
   **self-published on their own website** (the source URL is recorded). Use it the way they invite on that site, and
   prefer people who marked themselves **Available for hire**.
-* **Bluesky / Mastodon:** only public profiles whose own bio mentions the job and a nearby place. Emails are never
+* **Bluesky / Mastodon:** only public profiles whose own bio mentions the job and a nearby place. People are found
+  through profile search, profession starter packs and custom feeds (Bluesky), and profile search on several UK and
+  general servers plus the job's hashtag (Mastodon), but in every case their **own bio** must match. Emails are never
   lifted from bios; Mastodon results only include people who opted in to being discoverable, and Bluesky people who
-  hid their profile from logged-out visitors are skipped. Contact them through their profile or their own website.
+  hid their profile from logged-out visitors are skipped. A Bluesky handle that is the person's own domain
+  (e.g. *janesmith.co.uk*) counts as their website. Contact them through their profile or their own website.
 * **OpenStreetMap businesses** are firms and sole traders mapped by volunteers with the contact details published
   for the business (© OpenStreetMap contributors, ODbL). They are **businesses, not job seekers**; a sole trader's
   details are still personal data.
@@ -51,7 +54,7 @@ def _frame(rows: list[dict]) -> pd.DataFrame:
         (f"{y:g} yrs (estimated)" if "estimated" in (src or "") else f"{y:g} yrs") if pd.notna(y) else ""
         for y, src in zip(df["experience_years"], df["experience_source"])]
     for c in ("name", "headline", "company", "location", "email", "email_source", "website", "phone", "provider",
-              "match_reason", "other_profiles", "contract",
+              "match_reason", "other_profiles", "contract", "fit_reason", "last_active",
               "linkedin_url", "twitter_url"):
         df[c] = df[c].fillna("")
     return df
@@ -62,6 +65,7 @@ EXPORT_COLUMNS = {
     "distance_miles": "Miles away", "experience_years": "Experience (years)", "experience_source": "Experience source",
     "hireable": "Available for hire", "email": "Email", "email_source": "Email source", "phone": "Phone",
     "profile_url": "Profile / ad link", "website": "Website", "linkedin_url": "LinkedIn", "twitter_url": "X / Twitter",
+    "fit": "Best-match score", "fit_reason": "Score breakdown", "last_active": "Last active",
     "contract": "Contract (from profile)", "provider": "Found via", "match_reason": "Why they match", "other_profiles": "Other profiles",
     "profile_read": "Profile read", "found_at": "Found at (UTC)", "personal_data": "Personal data",
 }
@@ -72,7 +76,8 @@ NOTICE_LINES = [
     NOTICE, "",
     "Where the data came from:",
     "- GitHub: public profile fields only. Emails are never taken from GitHub (GitHub Acceptable Use Policies).",
-    "- Bluesky / Mastodon: public bios that mention the job (Mastodon: only people who opted in to discovery).",
+    "- Bluesky / Mastodon: public bios that mention the job, found via profile search, profession starter packs / feeds"
+    " or hashtags (Mastodon: only people who opted in to discovery).",
     "- OpenStreetMap: business / sole-trader listings (© OpenStreetMap contributors, ODbL) - businesses, not job seekers.",
     "- Team page: staff details the employer published on its own website.",
     "- 'self-published on personal website <url>': the person published it on their own site (source URL recorded).",
@@ -106,10 +111,10 @@ def cand_exports(query: str) -> dict:
     }
 
 CAND_DEFAULTS = {"c_github": True, "c_bsky": True, "c_masto": True, "c_osm": True, "c_team_urls": "",
-                 "c_f_contract": "Any", "c_sites": True, "c_ads": True, "c_ads_presets": True, "c_hireable": False,
+                 "c_f_contract": "Any", "c_uk_unknown": True, "c_f_near": False, "c_sites": True, "c_ads": True, "c_ads_presets": True, "c_hireable": False,
                  "c_unread": True, "c_unknown": False, "c_retention": 30, "c_max_profiles": 200, "c_max_accounts": 600,
                  "c_areas": 6, "c_wait": 0, "c_title": "", "c_postcode": "", "c_radius": 15, "c_exp": (3, 30),
-                 "c_keywords": "", "c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False}
+                 "c_keywords": "", "c_f_sort": "Best match", "c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False}
 
 
 def candidates_page():
@@ -133,14 +138,21 @@ def candidates_page():
                     help="Developers/data people whose public GitHub location is near the postcode. Skipped "
                          "automatically for non-software jobs.")
         st.checkbox("Bluesky public profiles", key="c_bsky",
-                    help="People whose public Bluesky bio mentions the job and a place near the postcode. Any job.")
+                    help="People whose public Bluesky bio mentions the job and a place near the postcode. Any job. Found via "
+                         "profile search (the job + your town and nearby areas), profession starter packs and "
+                         "profession custom feeds (e.g. 'NurseSky').")
         st.checkbox("Mastodon public profiles", key="c_masto",
                     help="People on Mastodon who opted in to being discoverable and whose bio mentions the job and "
-                         "a nearby place. Any job.")
+                         "a nearby place. Any job. Searches ~15 UK and general servers (UK regional servers from "
+                         "joinmastodon.org) plus recent posts under the job's hashtag, e.g. #nurse.")
         st.checkbox("OpenStreetMap businesses (trades, accountants, lawyers…)", key="c_osm",
                     help="Firms and sole traders mapped in OpenStreetMap for this kind of work (e.g. electricians, "
                          "plumbers, accountants, law firms) with the contact details published for them. Shown as "
                          "'business', not job seekers. Data © OpenStreetMap contributors (ODbL).")
+        st.toggle("Also show UK people who don't name a nearby town", key="c_uk_unknown",
+                  help="Bluesky/Mastodon people whose bio matches the job and is clearly UK-based (e.g. mentions the "
+                       "NHS, 'UK', a UK body like the NMC/SRA, or has a .uk handle) but doesn't name a town near the "
+                       "postcode. Shown with location 'UK - no nearby town mentioned' and ranked below local people.")
         with st.expander("Team / 'our people' pages (optional)"):
             st.text_area("Paste firm or chambers 'our people' page links, one per line", key="c_team_urls",
                          height=90, placeholder="https://www.example-law.co.uk/our-people")
@@ -234,6 +246,7 @@ def candidates_page():
                 include_unknown_distance=ss["c_unknown"], include_unread=ss["c_unread"],
                 fetch_websites=ss["c_sites"], max_wait_minutes=float(ss["c_wait"]),
                 max_results=int(ss["c_max_accounts"]), all_presets=ss["c_ads_presets"], team_urls=team_urls,
+                uk_unknown=ss["c_uk_unknown"],
                 job_sources=["remotive", "arbeitnow", "remoteok", "himalayas", "jobicy"],
                 companies=[l.strip() for l in ss.get("companies_text", "").splitlines() if l.strip()])
             radius, retention = float(ss["c_radius"]), int(ss["c_retention"])
@@ -273,7 +286,7 @@ def _apply(t) -> None:
     st.session_state["cand_coverage"] = res.coverage
     st.session_state["cand_tech"] = res.tech_role
     st.session_state.update({"c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False,
-                             "c_f_contract": "Any"})
+                             "c_f_contract": "Any", "c_f_sort": "Best match", "c_f_near": False})
 
 
 def _results() -> None:
@@ -306,14 +319,20 @@ def _results() -> None:
     g1, g2, g4, g3 = st.columns([1, 1, 2, 1])
     hire = g1.toggle("Only 'Available for hire'", key="c_f_hire")
     phone = g2.toggle("Only with phone", key="c_f_phone")
+    near = g1.toggle("Only near the postcode", key="c_f_near",
+                     help="Hide UK people who don't name a town near the postcode")
     contract = g4.radio("Contract type", ["Any", "Permanent", "Locum / temp / contract"], horizontal=True,
                         key="c_f_contract",
                         help="Matches what the person's own profile says (e.g. 'locum', 'bank', 'agency', 'contract', "
                              "'freelance' vs 'permanent'). Most profiles don't say, so this narrows a lot.")
 
+    sort = st.radio("Sort by", ["Best match", "Nearest", "Most experience", "Recently active"], horizontal=True,
+                    key="c_f_sort", help="Best match = job title in their own profile, distance, contact details, "
+                                         "experience fit and recent activity (see 'Score breakdown').")
+
     def reset():
         st.session_state.update({"c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False,
-                                 "c_f_contract": "Any"})
+                                 "c_f_contract": "Any", "c_f_sort": "Best match", "c_f_near": False})
     g3.button("Reset filters", on_click=reset, key="cand_reset_filters")
 
     view = df
@@ -336,6 +355,14 @@ def _results() -> None:
         view = view[view["hireable"] == "Yes"]
     if phone:
         view = view[view["phone"] != ""]
+    if near:
+        view = view[~view["location"].str.contains("no nearby town", regex=False)]
+    if sort == "Nearest":
+        view = view.sort_values("distance_miles", na_position="last", kind="stable")
+    elif sort == "Most experience":
+        view = view.sort_values("experience_years", ascending=False, na_position="last", kind="stable")
+    elif sort == "Recently active":
+        view = view.sort_values("last_active", ascending=False, kind="stable")
     view = view.reset_index(drop=True)
 
     with st.container(key="sticky_cands"):
@@ -354,9 +381,9 @@ def _results() -> None:
     if view.empty:
         st.info("No one matches these filters. Press **Reset filters** to see everyone again.")
     else:
-        cols = ["name", "provider", "profile_url", "match_reason", "email", "phone", "headline", "company", "location",
+        cols = ["name", "fit", "provider", "profile_url", "match_reason", "fit_reason", "email", "phone", "headline", "company", "location",
                 "distance_miles", "experience", "contract", "hireable", "email_source", "website", "other_profiles",
-                "linkedin_url", "twitter_url", "kind", "found_at"]
+                "linkedin_url", "twitter_url", "last_active", "kind", "found_at"]
         st.dataframe(view[cols], hide_index=True, width="stretch", height=min(560, 38 + 35 * len(view)),
                      key="cand_table", column_config={
             "name": st.column_config.TextColumn("Name", pinned=True),
@@ -372,6 +399,12 @@ def _results() -> None:
             "website": st.column_config.LinkColumn("Website"), "kind": "Type",
             "provider": st.column_config.TextColumn("Found via", help="Which public source(s) this person came from"),
             "match_reason": st.column_config.TextColumn("Why they match", width="medium"),
+            "fit": st.column_config.ProgressColumn("Best match", min_value=0, max_value=100, format="%.0f",
+                                                   help="0-100: job title in their own profile (45), distance (20), "
+                                                        "contact details (20), experience fit (10), recent activity (5)"),
+            "fit_reason": st.column_config.TextColumn("Score breakdown", width="medium"),
+            "last_active": st.column_config.TextColumn("Last active", help="Last public post we saw (Mastodon, "
+                                                       "Bluesky feeds); blank = not known"),
             "other_profiles": st.column_config.TextColumn("Other profiles", width="medium"),
             "contract": st.column_config.TextColumn("Contract", help="What their own profile says: temporary = "
                                                     "locum / agency / bank / contract / freelance"),

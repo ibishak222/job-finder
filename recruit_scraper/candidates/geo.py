@@ -127,3 +127,56 @@ class PlaceGeocoder:
             if self.cache.get(key):
                 return self.cache[key]
         return None
+
+
+# Cities / large towns people name in bios. Case-sensitive whole-word match, so ordinary words are not mistaken for
+# places; ambiguous names (Reading, Bath, Sale, Wells…) are left out on purpose.
+UK_TOWNS = (
+    "London Birmingham Manchester Liverpool Leeds Sheffield Bristol Newcastle Sunderland Nottingham Leicester Coventry "
+    "Bradford Wakefield Hull Stoke Wolverhampton Derby Plymouth Southampton Portsmouth Brighton Bournemouth Poole "
+    "Exeter Truro Swindon Oxford Cambridge Norwich Ipswich Colchester Chelmsford Southend Luton Milton Keynes "
+    "Northampton Peterborough Lincoln York Harrogate Scarborough Middlesbrough Durham Darlington Carlisle Preston "
+    "Blackpool Blackburn Burnley Bolton Wigan Warrington Chester Stockport Oldham Rochdale Salford Huddersfield "
+    "Halifax Doncaster Rotherham Barnsley Grimsby Gloucester Cheltenham Worcester Hereford Shrewsbury Telford "
+    "Canterbury Maidstone Dover Folkestone Guildford Woking Crawley Hastings Eastbourne Worthing Chichester "
+    "Winchester Basingstoke Salisbury Taunton Yeovil Torquay Barnstaple Watford Stevenage Slough Windsor "
+    "Cardiff Swansea Newport Wrexham Aberystwyth Bangor Glasgow Edinburgh Aberdeen Dundee Inverness Stirling Perth "
+    "Paisley Belfast Derry Lisburn Newry Cornwall Devon Somerset Dorset Kent Sussex Surrey Essex Suffolk Norfolk "
+    "Yorkshire Lancashire Cumbria Northumberland Merseyside Cheshire Shropshire Staffordshire Derbyshire "
+    "Nottinghamshire Lincolnshire Leicestershire Warwickshire Worcestershire Gloucestershire Wiltshire Hampshire "
+    "Berkshire Oxfordshire Buckinghamshire Hertfordshire Bedfordshire Cambridgeshire Northamptonshire Teesside "
+    "Tyneside Midlands Highlands Fife Ayrshire Lanarkshire Glamorgan Gwynedd Pembrokeshire Anglesey").split()
+_MULTI = ("Milton Keynes", "Stoke-on-Trent", "Isle of Wight", "Isle of Man", "Greater Manchester", "West Midlands",
+          "East Midlands", "Lake District", "Scottish Borders", "North Wales", "South Wales")
+_TOWN_RE = re.compile(r"(?<![A-Za-z])(" + "|".join(re.escape(t) for t in sorted(set(UK_TOWNS) - {"Milton", "Keynes"}
+                                                                        | set(_MULTI), key=len, reverse=True))
+                      + r")(?![A-Za-z])")
+_NATIONS = {"England": r"(?<!New )\bEngland\b|\bEnglish\b", "Scotland": r"\bScotland\b|\bScottish\b|\bAlba\b",
+            "Wales": r"\bWales\b|\bWelsh\b|\bCymru\b", "Northern Ireland": r"\bNorthern Ireland\b|\bNI\b"}
+_COUNTIES = {"Cornwall", "Devon", "Somerset", "Dorset", "Kent", "Sussex", "Surrey", "Essex", "Suffolk", "Norfolk",
+             "Yorkshire", "Lancashire", "Cumbria", "Northumberland", "Merseyside", "Cheshire", "Shropshire",
+             "Staffordshire", "Derbyshire", "Nottinghamshire", "Lincolnshire", "Leicestershire", "Warwickshire",
+             "Worcestershire", "Gloucestershire", "Wiltshire", "Hampshire", "Berkshire", "Oxfordshire",
+             "Buckinghamshire", "Hertfordshire", "Bedfordshire", "Cambridgeshire", "Northamptonshire", "Teesside",
+             "Tyneside", "Midlands", "Highlands", "Fife", "Ayrshire", "Lanarkshire", "Glamorgan", "Gwynedd",
+             "Pembrokeshire", "Anglesey", "Greater Manchester", "West Midlands", "East Midlands", "Lake District",
+             "Scottish Borders", "North Wales", "South Wales", "Isle of Wight", "Isle of Man"}
+
+
+def far_uk_place(text: str, place: "Place", radius_miles: float, geocoder: "PlaceGeocoder",
+                 slack: float = 3) -> Optional[str]:
+    """The first UK town/area named in `text` that is clearly outside the search radius (or another UK nation), so
+    a 'UK-based, no nearby town' profile that actually says 'Cardiff' or 'Preston-based' is not shown for Leeds."""
+    t = text or ""
+    country = (place.country or "").strip()
+    named = {n for n, rx in _NATIONS.items() if re.search(rx, t)}
+    if country in _NATIONS and named and country not in named:
+        return sorted(named)[0]
+    for m in _TOWN_RE.finditer(t):
+        name = m.group(1)
+        if name in _COUNTIES:
+            continue  # counties/regions are too big to judge distance from one point
+        co = geocoder.geocode(name)
+        if co and haversine_miles(place.lat, place.lon, *co) > radius_miles + slack:
+            return name
+    return None

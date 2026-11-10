@@ -34,6 +34,9 @@ class Candidate:
     match_score: float = 0.0      # how well their own profile text matches the job (3 exact, 2 synonym, 1 skill)
     match_reason: str = ""        # e.g. "profile says 'electrician'"
     other_profiles: str = ""      # the same person's profiles on other sites (merged duplicates), space-separated
+    last_active: str = ""         # last public activity we saw (Mastodon last post date, Bluesky feed post), YYYY-MM-DD
+    fit: float = 0.0              # overall 'best match' score 0-100 (role match, distance, contactability, experience, recency)
+    fit_reason: str = ""          # plain-English breakdown of the fit score
     found_at: str = field(default_factory=_now)
     personal_data: str = "yes - UK GDPR applies"
 

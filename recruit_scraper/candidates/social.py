@@ -27,8 +27,8 @@ from typing import Callable, Iterator, Optional
 from ..http import HttpClient
 from .cache import DiskCache
 from .contacts import SiteContactFinder
-from .geo import Place, PlaceGeocoder, haversine_miles, looks_non_uk
-from .matching import RoleMatcher, contract_type, find_place, place_terms, years_from_text
+from .geo import Place, PlaceGeocoder, far_uk_place, haversine_miles, looks_non_uk
+from .matching import RoleMatcher, contract_type, find_place, looks_like_business, place_terms, years_from_text
 from .models import Candidate
 
 log = logging.getLogger(__name__)
@@ -41,6 +41,48 @@ _SOCIAL = re.compile(r"linkedin\.com|twitter\.com|(^|//|\.)x\.com|facebook\.com|
 def strip_html(s: str) -> str:
     s = re.sub(r"<br\s*/?>|</p>", " \n", s or "", flags=re.I)
     return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+
+_FEDI = re.compile(r"(?<![\w/@.])@([A-Za-z0-9_]{1,30})@((?:[a-z0-9-]+\.)+[a-z]{2,})\b", re.I)
+_BSKY_HANDLE = re.compile(r"(?<![\w/@.])@?([a-z0-9-]{2,40}\.bsky\.social)\b", re.I)
+_UK_SLD = {"co", "org", "me", "ltd", "plc", "net", "ac", "gov", "nhs", "sch"}
+
+
+# clear signs a profile is UK-based even when it names no town (used only for the optional 'UK, town not stated' rows)
+UK_SIGNAL = re.compile(r"\b(uk|u\.k\.|united kingdom|britain|british|england|scotland|wales|cymru|northern ireland|"
+                       r"nhs|nmc|hcpc|cqc|sra|cilex|niceic|gas safe|cscs|acca|icaew|cima|aat|ofsted|pgce|qts)\b|🇬🇧|"
+                       r"🏴", re.I)
+# signs someone with UK ties actually lives abroad (then they are not shown as 'UK, no nearby town')
+ABROAD = re.compile(r"\b(exile|expat|ex-pat|immigrant|emigrated|living abroad|usa|u\.s\.a|"
+                    r"america|canada|australia|new zealand|(?<!northern )ireland|france|paris|germany|berlin|spain|"
+                    r"andaluc\w*|madrid|barcelona|portugal|lisbon|italy|netherlands|amsterdam|belgium|cyprus|greece|"
+                    r"sweden|norway|denmark|india|nigeria|ghana|kenya|south africa|dubai|uae|qatar|singapore|"
+                    r"hong kong|japan|china|brazil|mexico)\b|🇺🇸|🇨🇦|🇦🇺|🇳🇿|🇮🇪|🇫🇷|🇩🇪|🇪🇸|🇵🇹|🇮🇹|🇳🇱|🇧🇪|🇨🇾|🇬🇷|🇮🇳|🇳🇬", re.I)
+# Mastodon servers for one city/area: an account there with no stated town is taken to be from that area
+SERVER_TOWN = {"mcr.wtf": "Manchester", "glasgow.social": "Glasgow", "newforest.social": "New Forest",
+               "mastodon.iow.social": "Isle of Wight"}
+UK_SERVERS = {"mastodonapp.uk", "mastodon.scot", "toot.wales", "mastodon.me.uk", "mcr.wtf", "glasgow.social",
+              "newforest.social", "mastodon.iow.social"}
+
+
+def cross_links(text: str) -> list[str]:
+    """Profile links a person wrote in their own bio: '@jo@mastodon.social' and 'jo.bsky.social' handles.
+    Used only to merge the same person's rows across sites (and to show their other profiles)."""
+    out = [f"https://{inst.lower()}/@{user}" for user, inst in _FEDI.findall(text or "")]
+    out += [f"https://bsky.app/profile/{h.lower()}" for h in _BSKY_HANDLE.findall(text or "")]
+    return list(dict.fromkeys(out))
+
+
+def handle_site(handle: str) -> str:
+    """A Bluesky handle that is a person's own apex domain (e.g. 'janesmith.co.uk') is a website they control
+    (Bluesky verifies it via DNS/HTTPS), so it can be checked for contact details they published there."""
+    h = (handle or "").lower().strip(".")
+    labels = h.split(".")
+    if len(labels) < 2 or h.endswith((".bsky.social", ".brid.gy", ".bsky.team")) or "bsky" in labels:
+        return ""
+    if len(labels) == 2 or (len(labels) == 3 and labels[-1] == "uk" and labels[1] in _UK_SLD):
+        return f"https://{h}"
+    return ""
 
 
 def own_site(urls: list[str]) -> str:
@@ -56,12 +98,17 @@ class _BioProvider:
     label = ""
     pages = 2
 
-    def __init__(self, fetch_websites: bool = True, site_http: Optional[HttpClient] = None, max_queries: int = 8):
+    max_queries = 8
+
+    def __init__(self, fetch_websites: bool = True, site_http: Optional[HttpClient] = None,
+                 max_queries: Optional[int] = None, uk_unknown: bool = False):
         self.fetch_websites = fetch_websites
-        self.max_queries = max_queries
+        self.uk_unknown = uk_unknown
+        if max_queries is not None:
+            self.max_queries = max_queries
         self.notes: list[str] = []
-        self.stats = {"searches": 0, "profiles_seen": 0, "job_matches": 0, "in_area": 0, "websites_checked": 0,
-                      "website_emails": 0}
+        self.stats = {"searches": 0, "profiles_seen": 0, "job_matches": 0, "in_area": 0, "uk_town_not_stated": 0,
+                      "websites_checked": 0, "website_emails": 0}
         self.cache = DiskCache(f"{self.name}_search", 86400)
         self._site_http = site_http
 
@@ -72,11 +119,16 @@ class _BioProvider:
     def _search(self, q: str, page: int, state: dict) -> list[dict]:
         raise NotImplementedError
 
+    n_terms, n_areas = 4, 1
+
     def queries(self, matcher: RoleMatcher, place: Place) -> list[str]:
-        terms = matcher.search_terms(4)
+        """'<job> <town>' for the main town and a few nearby areas, then the job (and synonyms) on its own."""
+        terms = matcher.search_terms(max(4, self.n_terms))
         areas = [place.town] + (["London"] if (place.region or "").lower() == "london" else [])
-        areas = [re.sub(r",.*$", "", a) for a in dict.fromkeys(a for a in areas if a)]
-        qs = [f"{t} {a}" for t in terms[:2] for a in areas] + terms
+        areas += list(place.nearby_towns or [])[: max(0, self.n_areas - 1)]
+        areas = [re.sub(r",.*$", "", a) for a in dict.fromkeys(a for a in areas if a)][: max(1, self.n_areas + 1)]
+        qs = [f"{t} {a}" for t in terms[:2] for a in areas[:2]] + terms[:self.n_terms]
+        qs += [f"{t} {a}" for a in areas[2:] for t in terms[:1]] + [f"{t} {a}" for t in terms[2:3] for a in areas[:1]]
         return list(dict.fromkeys(qs))[: self.max_queries]
 
     def _collect(self, qs: list[str], progress) -> dict[str, dict]:
@@ -118,7 +170,12 @@ class _BioProvider:
         cands: list[Candidate] = []
         for p in people.values():
             text = " \n".join([p.get("name") or "", p.get("bio") or "", p.get("location") or ""])
-            m = matcher.match(p.get("bio"), p.get("location"), p.get("name"))
+            m = matcher.match(_URL.sub(" ", p.get("bio") or ""), p.get("location"))  # not words inside links
+            if not m.score:
+                # the job only in the display name counts when written as a title ('Jo Smith | Nurse', 'Sam (chef)'),
+                # not as a surname ('Peter Cook', 'Ann Mason')
+                parts = re.split(r"\s*[|•·,(/\-–—:]\s*", p.get("name") or "")
+                m = matcher.match(" ".join(parts[1:])) if len(parts) > 1 else m
             if not m.score:
                 continue
             self.stats["job_matches"] += 1
@@ -127,6 +184,11 @@ class _BioProvider:
             if looks_non_uk(loc or text) and not re.search(r"\b(uk|united kingdom|england|scotland|wales)\b", text, re.I):
                 continue
             dist = None
+            uk_only = False
+            if not area and p.get("home_town"):
+                co = geocoder.geocode(p["home_town"])   # e.g. an account on mcr.wtf (Manchester's server)
+                if co and haversine_miles(place.lat, place.lon, *co) <= radius_miles + 3:
+                    area = p["home_town"]
             if area:
                 co = geocoder.geocode(area)
                 if co:
@@ -134,21 +196,32 @@ class _BioProvider:
                 # area names are district-level, so allow a little slack beyond the radius
                 if dist is not None and dist > radius_miles + 3:
                     continue
+            elif self.uk_unknown and (p.get("uk_hint") or UK_SIGNAL.search(_URL.sub(" ", re.sub(r"(?i)new england",
+                                                                                                "", text)))):
+                if far_uk_place(text, place, radius_miles, geocoder) or ABROAD.search(_URL.sub(" ", text)):
+                    continue     # says they're in another UK town/nation (e.g. 'Cardiff', 'Preston-based') or abroad
+                uk_only = True   # clearly UK-based but names no town near the postcode: kept, ranked lower
             elif not include_unknown_distance:
                 continue
             yrs = years_from_text(p.get("bio") or "")
             if yrs is not None and ((min_exp and yrs < min_exp) or (max_exp and yrs > max_exp)):
                 continue
-            self.stats["in_area"] += 1
+            self.stats["uk_town_not_stated" if uk_only else "in_area"] += 1
             site = own_site(p.get("links") or [])
+            biz = looks_like_business(p.get("name") or "", p.get("bio") or "")
+            if biz:
+                self.stats["business_accounts"] = self.stats.get("business_accounts", 0) + 1
             cands.append(Candidate(
                 name=p.get("name") or p.get("handle") or "", headline=re.sub(r"\s+", " ", p.get("bio") or "")[:300],
-                location=loc or (area or ""), distance_miles=dist, experience_years=yrs,
+                location=(loc or (area or "")) if not uk_only else (f"{loc} (UK - no nearby town mentioned)" if loc
+                                                                     else "UK - no nearby town mentioned"),
+                distance_miles=dist, experience_years=yrs,
                 experience_source="stated in their bio" if yrs is not None else "",
                 profile_url=p["url"], website=site,
                 linkedin_url=next((u for u in p.get("links") or [] if "linkedin.com/in/" in u.lower()), ""),
-                kind="candidate", provider=self.name, profile_read=True,
-                match_score=m.score, match_reason=m.reason, contract=contract_type(p.get("bio") or ""),
+                kind="business" if biz else "candidate", provider=self.name, profile_read=True,
+                match_score=m.score, match_reason=m.reason + (f" (found via {p['via']})" if p.get("via") else ""),
+                contract=contract_type(p.get("bio") or ""), last_active=p.get("last_active") or "",
                 other_profiles=" ".join(u for u in (p.get("links") or []) if u != site)[:500]))
         if self.fetch_websites:
             with_site = [c for c in cands if c.website]
@@ -211,11 +284,79 @@ class BlueskyProvider(_BioProvider):
         if "!no-unauthenticated" in labels:
             return None  # they asked not to be shown to logged-out viewers
         bio = getattr(a, "description", None) or ""
+        links = [u.rstrip(".,;") for u in _URL.findall(bio)] + cross_links(bio)
+        if site := handle_site(a.handle):
+            links.append(site)  # their own verified domain, after any site they linked in the bio
         return {"id": a.did, "name": a.display_name or a.handle, "handle": a.handle,
                 "url": f"https://bsky.app/profile/{a.handle}", "bio": bio, "location": "",
-                "links": list(dict.fromkeys(u.rstrip(".,;") for u in _URL.findall(bio)))}
+                "links": list(dict.fromkeys(links)), "uk_hint": a.handle.lower().endswith(".uk")}
+
+    max_feeds = 3
+    n_terms, n_areas, max_queries = 5, 4, 14
 
     def extra_people(self, matcher: RoleMatcher, progress) -> dict[str, dict]:
+        people = self.starter_pack_people(matcher, progress)
+        for k, v in self.feed_people(matcher, progress).items():
+            people.setdefault(k, v)
+        return people
+
+    def feed_people(self, matcher: RoleMatcher, progress) -> dict[str, dict]:
+        """Recent posters in public Bluesky *custom feeds* for this profession (e.g. 'NurseSky', 'Legal Sky').
+        Their profiles are then read and, like everyone else, kept only if their OWN bio mentions the job."""
+        key = f"feeds|{matcher.core}"
+        hit = self.cache.get(key)
+        if hit is not None:
+            return hit
+        people: dict[str, dict] = {}
+        try:
+            c = self.client()
+            feeds, seen = [], set()
+            for term in matcher.search_terms(2):
+                progress(f"Bluesky: looking for '{term}' custom feeds…")
+                time.sleep(0.3)
+                res = c.app.bsky.unspecced.get_popular_feed_generators({"query": term, "limit": 15})
+                for fg in res.feeds or []:
+                    text = f"{fg.display_name or ''} {getattr(fg, 'description', '') or ''}"
+                    if fg.uri not in seen and matcher.match(text).score:
+                        seen.add(fg.uri)
+                        feeds.append(fg)
+            feeds = feeds[: self.max_feeds]
+            authors: dict[str, str] = {}
+            for fg in feeds:
+                cursor = None
+                for _ in range(2):
+                    time.sleep(0.3)
+                    params = {"feed": fg.uri, "limit": 100}
+                    if cursor:
+                        params["cursor"] = cursor
+                    page = c.app.bsky.feed.get_feed(params)
+                    for item in page.feed or []:
+                        post = item.post
+                        when = (getattr(post, "indexed_at", "") or "")[:10]
+                        authors[post.author.did] = max(authors.get(post.author.did, ""), when)
+                    cursor = getattr(page, "cursor", None)
+                    if not cursor:
+                        break
+            dids = list(authors)[:400]
+            progress(f"Bluesky: reading {len(dids)} profiles from {len(feeds)} profession feeds…")
+            for i in range(0, len(dids), 25):
+                time.sleep(0.3)
+                res = c.app.bsky.actor.get_profiles({"actors": dids[i:i + 25]})
+                for prof in res.profiles or []:
+                    d = self._person(prof)
+                    if d:
+                        d["last_active"] = authors.get(prof.did, "")
+                        d["via"] = "a Bluesky profession feed"
+                        people.setdefault(d["id"], d)
+            self.stats["profession_feeds"] = len(feeds)
+        except Exception as e:  # noqa: BLE001
+            log.warning("bluesky feeds failed: %s", e)
+            self.notes.append(f"profession feeds: {str(e)[:100]}")
+            return people
+        self.cache.set(key, people)
+        return people
+
+    def starter_pack_people(self, matcher: RoleMatcher, progress) -> dict[str, dict]:
         """Members of public Bluesky *starter packs* made for this profession (e.g. 'UK nurses', 'Legal Bluesky')."""
         key = f"packs|{matcher.core}"
         hit = self.cache.get(key)
@@ -252,6 +393,7 @@ class BlueskyProvider(_BioProvider):
                     for it in page.items or []:
                         d = self._person(it.subject)
                         if d:
+                            d["via"] = "a Bluesky starter pack"
                             people.setdefault(d["id"], d)
                     cursor = getattr(page, "cursor", None)
                     if not cursor:
@@ -265,18 +407,88 @@ class BlueskyProvider(_BioProvider):
         return people
 
 
+UK_HINT = re.compile(r"\b(uk|united kingdom|britain|british|england|scotland|scottish|wales|welsh|cymru|"
+                     r"northern ireland|london|manchester|glasgow|edinburgh|liverpool|leeds|birmingham|bristol|"
+                     r"newcastle|sheffield|nottingham|yorkshire|lancashire|kent|sussex|devon|cornwall|isle of wight|"
+                     r"new forest|cardiff|belfast)\b|\.uk$", re.I)
+
+
+def uk_servers(http: Optional[HttpClient] = None, cache: Optional[DiskCache] = None, limit: int = 10) -> list[str]:
+    """UK regional Mastodon servers listed on joinmastodon.org's public server directory (api.joinmastodon.org,
+    the same keyless list the joinmastodon.org website uses). Cached for a week; [] on any error."""
+    cache = cache or DiskCache("mastodon_servers", 7 * 86400)
+    hit = cache.get("uk")
+    if hit is not None:
+        return hit[:limit]
+    try:
+        http = http or HttpClient(min_interval=1.0, timeout=20, retries=1)
+        rows = http.get("https://api.joinmastodon.org/servers", params={"category": "regional"}).json()
+    except Exception as e:  # noqa: BLE001
+        log.info("joinmastodon server list failed: %s", e)
+        return []
+    out = [r["domain"] for r in sorted(rows, key=lambda r: -(r.get("total_users") or 0))
+           if r.get("domain") and (r.get("region") in ("europe", "", None))
+           and UK_HINT.search(f"{r.get('domain')} {r.get('description') or ''}")
+           and not re.search(r"\b(ireland|irish)\b", r.get("description") or "", re.I)]
+    cache.set("uk", out)
+    return out[:limit]
+
+
+def _acct_dict(a: dict, server: str) -> Optional[dict]:
+    """A Mastodon account -> our profile dict, or None if they didn't opt in to discovery (or are a bot/group)."""
+    if not a.get("discoverable") or a.get("bot") or a.get("noindex") or a.get("group"):
+        return None
+    fields = a.get("fields") or []
+    loc = next((strip_html(f.get("value", "")) for f in fields
+                if re.search(r"location|based|where|city|town", f.get("name", ""), re.I)), "")
+    links = []
+    for f in sorted(fields, key=lambda f: not f.get("verified_at")):
+        links += re.findall(r'href="([^"]+)"', f.get("value", ""))
+    links += re.findall(r'href="([^"]+)"', a.get("note") or "")
+    links = [u for u in dict.fromkeys(links) if "/tags/" not in u and not re.search(r"/@\w+$", u)
+             or u.startswith("https://bsky.app")]
+    acct = a.get("acct") or ""
+    if "@" not in acct:
+        acct = f"{acct}@{server}"
+    extra = " ".join(strip_html(f.get("value", "")) for f in fields)
+    bio = strip_html(a.get("note") or "") + (" | " + extra if extra else "")
+    links += [u for u in cross_links(bio) if u.split("/@")[0] not in (a.get("url") or "")]
+    last = a.get("last_status_at") or ""
+    home = acct.rsplit("@", 1)[-1].lower()
+    return {"id": acct.lower(), "name": a.get("display_name") or acct, "handle": acct, "url": a.get("url") or "",
+            "bio": bio, "location": loc, "links": list(dict.fromkeys(links)),
+            "last_active": str(last)[:10] if last else "",
+            "home_town": SERVER_TOWN.get(home, ""), "uk_hint": home in UK_SERVERS or home.endswith(".uk")}
+
+
 class MastodonProvider(_BioProvider):
     name = "mastodon"
     label = "Mastodon"
     pages = 1
-    # big general servers + UK-focused ones (all allow unauthenticated account search; robots.txt allows /api/v2)
-    DEFAULT_SERVERS = ("mastodon.social", "mastodonapp.uk", "mastodon.scot", "toot.wales", "mstdn.social")
+    n_terms, n_areas, max_queries = 4, 2, 8
+    # big general servers + UK-focused ones (all allow unauthenticated account search; robots.txt allows /api/v2).
+    # Each server's search also covers the remote accounts it knows, so more servers = more of the fediverse.
+    DEFAULT_SERVERS = ("mastodon.social", "mastodonapp.uk", "mastodon.scot", "toot.wales", "mstdn.social",
+                       "mastodon.online", "mastodon.world", "mas.to", "universeodon.com", "mastodon.me.uk",
+                       "mcr.wtf", "glasgow.social")
+    HASHTAG_SERVERS = ("mastodon.social", "mastodonapp.uk", "mastodon.online")
 
-    def __init__(self, *a, servers: tuple[str, ...] = DEFAULT_SERVERS, factory=None, **kw):
+    def __init__(self, *a, servers: Optional[tuple[str, ...]] = None, factory=None, discover_servers: bool = True,
+                 hashtags: bool = True, **kw):
         super().__init__(*a, **kw)
-        self.servers = list(servers)
+        self.servers = list(servers or self.DEFAULT_SERVERS)
+        self._discover = discover_servers and servers is None and factory is None
+        self.hashtags = hashtags
         self._factory = factory
         self._apis: dict = {}
+
+    def search(self, *a, **kw):
+        if self._discover:
+            extra = [d for d in uk_servers() if d not in self.servers]
+            self.servers += extra
+            self.stats["servers"] = len(self.servers)
+            self._discover = False
+        yield from super().search(*a, **kw)
 
     def api(self, server: str):
         if server not in self._apis:
@@ -288,39 +500,64 @@ class MastodonProvider(_BioProvider):
                                               version_check_mode="none")
         return self._apis[server]
 
+    def _search_server(self, server: str, q: str) -> tuple[list[dict], bool, str]:
+        try:
+            # unauthenticated search can't paginate, so one page (top results) per query and server
+            res = self.api(server).search_v2(q, result_type="accounts", resolve=False)
+        except Exception as e:  # noqa: BLE001
+            log.info("mastodon %s search failed: %s", server, e)
+            return [], False, f"{server}: {str(e)[:100]}"
+        accts = res.get("accounts") or []
+        return [d for d in (_acct_dict(a, server) for a in accts) if d], len(accts) >= 20, ""
+
     def _search(self, q: str, page: int, state: dict) -> list[dict]:
         out: list[dict] = []
         more = False
-        for server in self.servers:
-            time.sleep(0.3)
-            try:
-                # unauthenticated search can't paginate, so one page (top results) per query and server
-                res = self.api(server).search_v2(q, result_type="accounts", resolve=False)
-            except Exception as e:  # noqa: BLE001
-                log.info("mastodon %s search failed: %s", server, e)
-                state.setdefault("errors", []).append(f"{server}: {str(e)[:100]}")
-                continue
-            accts = res.get("accounts") or []
-            more = more or len(accts) >= 20
-            for a in accts:
-                if not a.get("discoverable") or a.get("bot") or a.get("noindex") or a.get("group"):
-                    continue
-                fields = a.get("fields") or []
-                loc = next((strip_html(f.get("value", "")) for f in fields
-                            if re.search(r"location|based|where|city|town", f.get("name", ""), re.I)), "")
-                links = []
-                for f in sorted(fields, key=lambda f: not f.get("verified_at")):
-                    links += re.findall(r'href="([^"]+)"', f.get("value", ""))
-                links += re.findall(r'href="([^"]+)"', a.get("note") or "")
-                links = [u for u in dict.fromkeys(links) if "/tags/" not in u and not re.search(r"/@\w+$", u)
-                         or u.startswith("https://bsky.app")]
-                url = a.get("url") or ""
-                acct = a.get("acct") or ""
-                if "@" not in acct:
-                    acct = f"{acct}@{server}"
-                extra = " ".join(strip_html(f.get("value", "")) for f in fields)
-                out.append({"id": acct.lower(), "name": a.get("display_name") or acct, "handle": acct, "url": url,
-                            "bio": strip_html(a.get("note") or "") + (" | " + extra if extra else ""),
-                            "location": loc, "links": links})
+        # one request per server, in parallel (different hosts), so many servers stay quick and polite
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for rows, m, err in ex.map(lambda sv: self._search_server(sv, q), self.servers):
+                out += rows
+                more = more or m
+                if err:
+                    state.setdefault("errors", []).append(err)
         state["more"] = more
         return out
+
+    def extra_people(self, matcher: RoleMatcher, progress) -> dict[str, dict]:
+        """Authors of recent public posts under the job's hashtag (e.g. #nurse, #electrician, #solicitor) on a few
+        big servers. Same opt-in rules (discoverable, not noindex, not a bot) and the bio must still match."""
+        if not self.hashtags:
+            return {}
+        tags = list(dict.fromkeys(re.sub(r"[^a-z0-9]", "", t.lower()) for t in matcher.search_terms(3)))[:3]
+        key = f"tags|{'|'.join(tags)}"
+        hit = self.cache.get(key)
+        if hit is not None:
+            return hit
+        people: dict[str, dict] = {}
+        for server in self.HASHTAG_SERVERS:
+            for tag in tags:
+                if not tag:
+                    continue
+                progress(f"Mastodon: reading #{tag} posts on {server}…")
+                max_id = None
+                for _ in range(2):
+                    time.sleep(0.3)
+                    try:
+                        kw = {"limit": 40}
+                        if max_id:
+                            kw["max_id"] = max_id
+                        posts = self.api(server).timeline_hashtag(tag, **kw)
+                    except Exception as e:  # noqa: BLE001
+                        log.info("mastodon hashtag %s on %s failed: %s", tag, server, e)
+                        break
+                    for st in posts or []:
+                        d = _acct_dict(st.get("account") or {}, server)
+                        if d:
+                            d["via"] = f"#{tag} posts"
+                            people.setdefault(d["id"], d)
+                    if not posts or len(posts) < 40:
+                        break
+                    max_id = posts[-1].get("id")
+        self.stats["hashtag_authors"] = len(people)
+        self.cache.set(key, people)
+        return people

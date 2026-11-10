@@ -11,3 +11,6 @@ dateparser>=1.2
 # extra candidate sources (keyless public APIs): Bluesky via MarshalX/atproto, Mastodon via halcy/Mastodon.py
 atproto>=0.0.60,<0.1
 Mastodon.py>=2.0,<3
+# better matching quality: fuzzy cross-site dedupe (rapidfuzz/RapidFuzz, MIT) and phone validation (daviddrysdale/python-phonenumbers, Apache-2.0)
+rapidfuzz>=3.9,<4
+phonenumbers>=8.13,<10

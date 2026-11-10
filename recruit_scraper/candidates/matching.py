@@ -114,6 +114,9 @@ def _phrase_re(phrase: str) -> re.Pattern:
     return re.compile(rf"(?<![a-z0-9]){body}(s|es)?(?![a-z0-9])", re.I)
 
 
+_ACRONYM = re.compile(r"^([b-df-hj-np-tv-z&]{2,5}|[a-z]{1,2}&[a-z]|acca|aca|cima|rnld|rmn|rgn|hca|icu|itu|sen|senco|gp)$")
+
+
 def is_tech_role(title: str) -> bool:
     return bool(TECH_WORDS.search(title or ""))
 
@@ -162,7 +165,8 @@ class RoleMatcher:
         for s in self.synonyms + self.related:
             if len(out) >= n:
                 break
-            if len(s) > 3 and s not in out:  # skip ambiguous acronyms like 'pa', 'ta' for searching
+            # skip ambiguous acronyms like 'pa', 'ta', 'rnld', 'hca' for searching (they still count when matching)
+            if len(s) > 3 and s not in out and not _ACRONYM.match(s):
                 out.append(s)
         return [o for o in out if o]
 
@@ -195,11 +199,34 @@ class RoleMatcher:
         return Match(score, reason)
 
 
-_FORMER = re.compile(r"\b(retired|former(ly)?|ex|failed|recovering|recovered|used to be|one-?time|previous life|past life)\b[\s\-,]*(\w+[\s,]+){0,3}$",
+_FORMER = re.compile(r"\b(retired|former(ly)?|ex|failed|recovering|recovered|used to be|one-?time|previous life|past life)\b[\s\-,]*([\w/&\-]+[\s,]+){0,3}$",
                      re.I)
 _ORG = re.compile(r"^\W*(we|our)\b|\b(we are|we provide|we offer|we specialise|our team|contact us|call us|"
                   r"get in touch with us|services ltd|official account)\b", re.I)
 _PERSON = re.compile(r"\b(i|i'm|im|my|me|he/him|she/her|they/them)\b", re.I)
+
+
+_BIZ_NAME = re.compile(r"\b(ltd|limited|llp|plc|cic|inc|services|solutions|group|agency|associates|partners|& co|"
+                       r"electricians|plumbers|accountants|solicitors|builders|roofers|carers|recruitment|consultancy|"
+                       r"news|journal|magazine|podcast|official|council|charity|association|society|network|"
+                       r"foundation|trust|union|federation|institute|uk)\b", re.I)
+_BIZ_BIO = re.compile(r"\b(provides?|delivers?|offering|we('re| are| provide| offer| help| support)|our (team|services|"
+                      r"clients|firm|practice|members)|(is|are) an? (independent|leading|award[- ]winning|professional|"
+                      r"chartered|family[- ]run|local|trusted|uk)[\w\s,&-]{0,40}(firm|company|practice|business|charity|"
+                      r"organisation|organization|provider|agency|union|journal)|firm of|charity for|journal of|"
+                      r"official (account|journal)|registered charity|company number|tel:|call us|ltd|limited|llp|"
+                      r"book (now|online|"
+                      r"a free)|free quote)\b", re.I)
+
+
+def looks_like_business(name: str, bio: str) -> bool:
+    """True for firm / organisation / news accounts (e.g. 'Beckenham Electricians provides…', 'Budget Accountants is an
+    ACCA-chartered company…'), which are shown as businesses, not as individual candidates."""
+    if _BIZ_NAME.search(name or ""):
+        return True
+    b = bio or ""
+    return bool(_BIZ_BIO.search(b)) and not re.search(r"\b(i'm|i am|i've|my|me)\b|\b(he|she|they)/(him|her|them)\b",
+                                                      b, re.I)
 
 
 CONTRACT_TEMP = re.compile(r"\b(locum|agency|bank (nurse|staff|shifts?|work)|bank|temp|temporary|contract(or|ing)?|"

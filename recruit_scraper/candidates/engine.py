@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
+from datetime import date
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -74,31 +76,155 @@ def merge_duplicates(cands: list[Candidate]) -> list[Candidate]:
             for k in ks:
                 index.setdefault(k, c)
             continue
-        if c.provider not in hit.provider.split(" + "):
-            hit.provider = f"{hit.provider} + {c.provider}"
-        links = [u for u in (hit.other_profiles or "").split() if u]
-        if c.profile_url and _norm_link(c.profile_url) != _norm_link(hit.profile_url):
-            links.append(c.profile_url)
-        hit.other_profiles = " ".join(dict.fromkeys(links))
-        for f in ("email", "email_source", "phone", "website", "linkedin_url", "twitter_url", "location", "company",
-                  "contract"):
-            if not getattr(hit, f) and getattr(c, f):
-                setattr(hit, f, getattr(c, f))
-        if hit.distance_miles is None and c.distance_miles is not None:
-            hit.distance_miles = c.distance_miles
-        if hit.experience_years is None and c.experience_years is not None:
-            hit.experience_years, hit.experience_source = c.experience_years, c.experience_source
+        _absorb(hit, c)
         for k in ks:
             index.setdefault(k, hit)
     return out
 
 
+def _absorb(hit: Candidate, c: Candidate) -> None:
+    """Fold duplicate row `c` into `hit` (keeps hit's values, fills gaps, records the other source and link)."""
+    for prov in c.provider.split(" + "):
+        if prov not in hit.provider.split(" + "):
+            hit.provider = f"{hit.provider} + {prov}"
+    links = [u for u in (hit.other_profiles or "").split() if u]
+    for u in [c.profile_url] + (c.other_profiles or "").split():
+        if u and _norm_link(u) != _norm_link(hit.profile_url):
+            links.append(u)
+    hit.other_profiles = " ".join(dict.fromkeys(links))
+    for f in ("email", "email_source", "phone", "website", "linkedin_url", "twitter_url", "location", "company",
+              "contract"):
+        if not getattr(hit, f) and getattr(c, f):
+            setattr(hit, f, getattr(c, f))
+    if hit.distance_miles is None and c.distance_miles is not None:
+        hit.distance_miles = c.distance_miles
+    if hit.experience_years is None and c.experience_years is not None:
+        hit.experience_years, hit.experience_source = c.experience_years, c.experience_source
+    hit.last_active = max(hit.last_active or "", c.last_active or "")
+    hit.match_score = max(hit.match_score or 0, c.match_score or 0)
+
+
+_NAME_JUNK = re.compile(r"\(.*?\)|\b(he|she|they)/(him|her|them|they)\b|\b(dr|mr|mrs|ms|miss|rn|rgn|rmn|msc|bsc|ba|"
+                        r"llb|cert|frcs|mbe|obe)\b\.?|[^a-z\s'\-]", re.I)
+
+
+def _clean_name(name: str) -> str:
+    n = _NAME_JUNK.sub(" ", (name or "").lower())
+    return " ".join(w for w in n.split() if len(w) > 1)
+
+
+def merge_similar(cands: list[Candidate], threshold: float = 92) -> list[Candidate]:
+    """Second dedupe pass for the same person on two sites WITHOUT a shared link: near-identical full names
+    (RapidFuzz token-sort ratio >= threshold, at least first + last name) in the same area (within 3 miles, or the
+    same location text), found on different sources. Conservative on purpose: common names in different towns,
+    or two accounts on the same site, are never merged."""
+    try:
+        from rapidfuzz import fuzz  # https://github.com/rapidfuzz/RapidFuzz (MIT)
+        ratio = fuzz.token_sort_ratio
+    except ImportError:  # pragma: no cover - fall back to the standard library
+        import difflib
+
+        def ratio(a, b):
+            return 100 * difflib.SequenceMatcher(None, " ".join(sorted(a.split())), " ".join(sorted(b.split()))).ratio()
+    out: list[Candidate] = []
+    for c in cands:
+        name = _clean_name(c.name)
+        hit = None
+        if c.kind == "candidate" and len(name.split()) >= 2:
+            for o in out:
+                if o.kind != "candidate" or set(o.provider.split(" + ")) & set(c.provider.split(" + ")):
+                    continue
+                oname = _clean_name(o.name)
+                if len(oname.split()) < 2 or ratio(name, oname) < threshold:
+                    continue
+                near = (o.distance_miles is not None and c.distance_miles is not None
+                        and abs(o.distance_miles - c.distance_miles) <= 3)
+                same_loc = bool(o.location) and o.location.strip().lower() == (c.location or "").strip().lower()
+                if near or same_loc:
+                    hit = o
+                    break
+        if hit is None:
+            out.append(c)
+        else:
+            _absorb(hit, c)
+            hit.match_reason = (hit.match_reason + "; same name and area on " + c.provider).strip("; ")
+    return out
+
+
+def _days_since(day: str) -> Optional[int]:
+    try:
+        return (date.today() - date.fromisoformat(day[:10])).days
+    except (TypeError, ValueError):
+        return None
+
+
+def score_fit(c: Candidate, radius: float, min_exp: Optional[float] = None, max_exp: Optional[float] = None,
+              want: str = "") -> Candidate:
+    """'Best match' score 0-100 with a plain-English breakdown:
+    role match 45 · distance 20 · contactable 20 · experience fit 10 · recent activity 5 (+ contract / for-hire)."""
+    parts, total = [], 0.0
+    ms = c.match_score or 0
+    total += 45 * min(1.0, max(0.0, ms) / 3)
+    parts.append("job title in profile" if ms >= 3 else "synonym in profile" if ms >= 2 else "related words in profile")
+    if c.distance_miles is not None:
+        total += 20 * max(0.0, 1 - c.distance_miles / (radius + 3))
+        parts.append(f"{c.distance_miles:g} mi away")
+    elif _uk_only(c):
+        parts.append("UK, no nearby town mentioned")
+    else:
+        total += 6
+        parts.append("distance unknown")
+    if c.email:
+        total += 15
+        parts.append("has email")
+    elif c.website:
+        total += 7
+        parts.append("has website")
+    elif c.profile_url:
+        total += 3
+    if c.phone:
+        total += 5
+        parts.append("has phone")
+    y = c.experience_years
+    if y is None:
+        total += 4
+    elif (min_exp is None or y >= min_exp) and (max_exp is None or y <= max_exp):
+        total += 10
+        parts.append(f"{y:g} yrs fits")
+    else:
+        parts.append(f"{y:g} yrs outside range")
+    d = _days_since(c.last_active)
+    if d is None:
+        total += 2
+    elif d <= 180:
+        total += 5
+        parts.append("active recently")
+    elif d <= 730:
+        total += 2
+    else:
+        parts.append("inactive 2+ yrs")
+    if want and c.contract == want:
+        total += 5
+        parts.append("says " + ("locum/temp/contract" if want == "temporary" else "permanent"))
+    if c.hireable:
+        total += 3
+        parts.append("available for hire")
+    c.fit = round(min(100.0, total), 1)
+    c.fit_reason = " · ".join(parts)
+    return c
+
+
+def _uk_only(c: Candidate) -> bool:
+    return "no nearby town mentioned" in (c.location or "")
+
+
 def rank_key(c: Candidate, min_exp: Optional[float] = None, max_exp: Optional[float] = None, contract: str = ""):
+    """Best matches first: people, then businesses, then hiring contacts; within each, highest fit score."""
     y = c.experience_years
     exp_fit = 1 if y is None else (0 if (min_exp is None or y >= min_exp) and (max_exp is None or y <= max_exp) else 2)
     kind = {"candidate": 0, "business": 1}.get(c.kind, 2)
     bonus = 0.25 if contract and c.contract == contract else 0
-    return (kind, -((c.match_score or 0) + bonus), exp_fit, not c.email,
+    return (kind, _uk_only(c), -(c.fit or 0), -((c.match_score or 0) + bonus), exp_fit, not c.email,
             c.distance_miles if c.distance_miles is not None else 999)
 
 
@@ -132,6 +258,7 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
                     delay: float = 1.0, include_unread: bool = True, fetch_websites: bool = True,
                     max_wait_minutes: float = 0, max_results: int = 1000, all_presets: bool = False,
                     company_pages: bool = True, team_urls: list[str] = (), contract: str = "any",
+                    uk_unknown: bool = True,
                     progress: Callable[[str], None] = lambda m: None, cancel=None) -> CandidateResult:
     if cancel is not None:  # stop at the next progress message once the user presses Cancel
         _report = progress
@@ -158,9 +285,9 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
                                      include_unread=include_unread, fetch_websites=fetch_websites,
                                      max_wait_minutes=max_wait_minutes))
     if "bluesky" in providers and not hireable_only:
-        people.append(BlueskyProvider(fetch_websites=fetch_websites))
+        people.append(BlueskyProvider(fetch_websites=fetch_websites, uk_unknown=uk_unknown))
     if "mastodon" in providers and not hireable_only:
-        people.append(MastodonProvider(fetch_websites=fetch_websites))
+        people.append(MastodonProvider(fetch_websites=fetch_websites, uk_unknown=uk_unknown))
     if "openstreetmap" in providers and not hireable_only:
         people.append(OpenStreetMapProvider(fetch_websites=fetch_websites))
     if ("team_pages" in providers or team_urls) and not hireable_only and team_urls:
@@ -212,22 +339,26 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
 
     # people must match the job in their own profile text; never pad with location-only results
     found = [c for c in found if c.kind != "candidate" or (c.match_score or 0) > 0]
-    uniq = merge_duplicates(found)
+    uniq = merge_similar(merge_duplicates(found))
     entries = suppression.load() if suppression_entries is None else suppression_entries
     uniq, result.suppressed = suppression.apply(uniq, entries)
     want = RoleMatcher(title).contract or ("" if contract in ("any", "", None) else contract)
     if contract in ("permanent", "temporary"):
         uniq = [c for c in uniq if c.kind != "candidate" or c.contract == contract]
+    for c in uniq:
+        score_fit(c, radius_miles, min_exp, max_exp, want)
     uniq.sort(key=lambda c: rank_key(c, min_exp, max_exp, want))
     n_people = sum(1 for c in uniq if c.kind == "candidate")
+    n_uk = sum(1 for c in uniq if c.kind == "candidate" and "no nearby town" in (c.location or ""))
     n_biz = sum(1 for c in uniq if c.kind == "business")
     if not tech:
         result.coverage = (f"'{title}' isn't a software job, so GitHub (developers only) was skipped. People were "
-                           "looked for on Bluesky (search + profession starter packs) and Mastodon, where they "
-                           "describe their own job in their bio"
+                           "looked for on Bluesky (search, profession starter packs and feeds) and Mastodon (UK and "
+                           "general servers, job hashtags), where they describe their own job in their bio"
                            + (", plus businesses/sole traders mapped in OpenStreetMap" if "openstreetmap" in providers else "")
                            + ". Free public sources cover jobs like this thinly"
                            + (f": {n_people} matching people" if n_people else ": nobody's public profile matched")
+                           + (f" ({n_uk} of them UK-based but not naming a town near here - ranked lower)" if n_uk else "")
                            + (f" and {n_biz} businesses (firms / sole traders, not job seekers)" if n_biz else "")
                            + f" near {place.town}."
                            + " For more reach, use the hiring contacts on the Jobs page, or a CV database "

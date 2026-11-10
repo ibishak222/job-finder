@@ -103,10 +103,44 @@ def parse_page(html: str, base_url: str) -> dict:
                         linkedin = str(same)
     for s in soup(["script", "style", "noscript"]):
         s.decompose()
-    for e in find_emails(soup.get_text(" ")):
+    text = soup.get_text(" ")
+    for e in find_emails(text):
         if e not in emails:
             emails.append(e)
-    return {"emails": emails, "phones": phones, "linkedin": linkedin, "twitter": twitter}
+    return {"emails": emails, "phones": clean_phones(phones, text), "linkedin": linkedin, "twitter": twitter}
+
+
+def clean_phones(raw: list[str], text: str = "", max_from_text: int = 2) -> list[str]:
+    """Validate and format phone numbers the owner published (tel: links, schema.org telephone, and numbers written
+    in the page text) with Google's libphonenumber rules (https://github.com/daviddrysdale/python-phonenumbers).
+    UK by default; invalid numbers (dates, IDs, order numbers) are dropped. Falls back to the raw list if the
+    library is missing."""
+    try:
+        import phonenumbers
+    except ImportError:  # pragma: no cover
+        return list(dict.fromkeys(raw))
+    out: list[str] = []
+
+    def add(num, strict: bool = True) -> None:
+        # numbers the owner explicitly marked as a phone (tel: link / schema.org) only need to be possible;
+        # numbers spotted in page text must be fully valid so dates and reference numbers are not picked up
+        if phonenumbers.is_valid_number(num) or (not strict and phonenumbers.is_possible_number(num)):
+            f = phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
+            if f not in out:
+                out.append(f)
+
+    for r in raw:
+        try:
+            add(phonenumbers.parse(r, "GB"), strict=False)
+        except phonenumbers.NumberParseException:
+            continue
+    if text:
+        for i, m in enumerate(phonenumbers.PhoneNumberMatcher(text[:200_000], "GB",
+                                                              leniency=phonenumbers.Leniency.VALID)):
+            if i >= max_from_text:
+                break
+            add(m.number)
+    return out
 
 
 class SiteContactFinder:
