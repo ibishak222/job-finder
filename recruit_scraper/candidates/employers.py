@@ -54,6 +54,11 @@ ROLE_EMPLOYERS: list[tuple[re.Pattern, list[str]]] = [
     (re.compile(r"\b(hca|health ?care assistant|nursing assistant|nursing associate|clinical support)", re.I),
      ["gp", "care_home", "hospital"]),
     (re.compile(r"\bnurs(e|es|ing)\b|\brgn\b|\brmn\b|midwi", re.I), ["gp", "care_home", "hospital", "clinic"]),
+    # official registers only (see registers.py): kitchens, schools, barristers' chambers
+    (re.compile(r"\b(chef|cook|kitchen|sous|commis|catering|pastry)\b", re.I), ["food"]),
+    (re.compile(r"\b(teacher|teaching assistant|senco|sendco|headteacher|head teacher|nqt|early career teacher|"
+                r"cover supervisor|learning support assistant)\b", re.I), ["school"]),
+    (re.compile(r"\bbarrister|\bfamily (lawyer|law|solicitor)|\bkc\b|\bcounsel\b", re.I), ["barristers"]),
 ]
 
 
@@ -69,6 +74,8 @@ class EmployerLead:
     """An organisation that employs this kind of worker (business contact details only). Not a candidate."""
     name: str = ""
     employer_type: str = ""
+    contact_name: str = ""    # only from an official register (registered manager, nurse prescriber, barrister, head)
+    contact_role: str = ""
     address: str = ""
     postcode: str = ""
     distance_miles: Optional[float] = None
@@ -140,8 +147,8 @@ def merge_leads(ods: list[EmployerLead], osm: list[EmployerLead]) -> list[Employ
         for f in ("phone", "email", "website", "address", "postcode"):
             if not getattr(hit, f) and getattr(o, f):
                 setattr(hit, f, getattr(o, f))
-        if "OpenStreetMap" not in hit.source:
-            hit.source += " + OpenStreetMap"
+        if o.source not in hit.source:
+            hit.source += f" + {o.source}"
             hit.source_url = f"{hit.source_url} {o.source_url}".strip()
     return out
 
@@ -151,6 +158,8 @@ def suppress_leads(leads: list[EmployerLead], entries: Iterable[str]) -> tuple[l
     ents = [e.strip().lower().rstrip("/") for e in entries if e and e.strip()]
     kept = []
     for l in leads:
+        if l.contact_name and l.contact_name.lower() in ents:
+            continue          # a named register contact can be suppressed by name too
         email = l.email.lower()
         site = l.website.lower().split("://", 1)[-1].removeprefix("www.").rstrip("/")
         urls = [u.lower().rstrip("/") for u in l.source_url.split()]
@@ -173,12 +182,13 @@ class EmployerLeadsFinder:
     name = "employers"
 
     def __init__(self, http: Optional[HttpClient] = None, osm_http: Optional[HttpClient] = None,
-                 max_districts: int = 15, max_details: int = 40, max_leads: int = 150, max_geocode: int = 600,
-                 osm_radius_miles: float = 6):
+                 max_districts: int = 15, max_details: int = 40, max_leads: int = 250, max_geocode: int = 600,
+                 osm_radius_miles: float = 6, registers=True, max_named: int = 150):
         self.http = http or HttpClient(min_interval=0.3, timeout=30, retries=2, backoff=2)
         self.osm_http = osm_http or overpass_http()  # short timeouts + overall budget: don't stall the search
         self.max_districts, self.max_details, self.max_leads = max_districts, max_details, max_leads
         self.max_geocode, self.osm_radius = max_geocode, osm_radius_miles
+        self.registers, self.max_named = registers, max_named     # True / False / a RegistersFinder (tests)
         self.cache = DiskCache("employers", 7 * 86400)
         self.osm_cache = DiskCache("osm", 86400)
         self.notes: list[str] = []
@@ -299,6 +309,8 @@ class EmployerLeadsFinder:
 
     def osm_leads(self, kinds: list[str], place: Place, radius_miles: float,
                   progress: Callable[[str], None] = lambda m: None) -> list[EmployerLead]:
+        if not any(OSM_FILTERS.get(k) for k in kinds):
+            return []
         q = self.osm_query(kinds, place, radius_miles)
         els = self.osm_cache.get(q)
         if els is None:
@@ -307,8 +319,8 @@ class EmployerLeadsFinder:
                 els = overpass_elements(self.osm_http, q)
                 self.osm_cache.set(q, els)
             except OverpassUnavailable as e:
-                self.notes.append(f"OpenStreetMap's Overpass servers didn't answer ({e}); showing NHS ODS records "
-                                  "only - search again later for websites/phones from OpenStreetMap")
+                self.notes.append(f"OpenStreetMap's Overpass servers didn't answer ({e}); showing NHS ODS / official "
+                                  "register records only - search again later for OpenStreetMap websites/phones")
                 return []
         out = []
         for e in els:
@@ -351,6 +363,30 @@ class EmployerLeadsFinder:
             return "home_care"
         return "care_home" if "care_home" in kinds else kinds[0]
 
+    # --- official registers (CQC, Care Inspectorate, ODS CSVs, FSA, GIAS, Charity Commission, BSB) ---------
+    def register_leads(self, kinds: list[str], title: str, place: Place, radius_miles: float,
+                       progress: Callable[[str], None]) -> tuple[list[EmployerLead], list[EmployerLead]]:
+        from .registers import RegistersFinder
+        try:
+            dists = self.districts(place, radius_miles)
+        except (requests.RequestException, ValueError) as e:
+            self.notes.append(f"postcode districts unavailable ({type(e).__name__}); official registers skipped")
+            return [], []
+        finder = self.registers if not isinstance(self.registers, bool) else RegistersFinder()
+        rows = finder.find(kinds, title, place, radius_miles, dists, self.geocode_postcodes, progress)
+        self.notes += finder.notes
+        self.stats.update({f"register_{k}": v for k, v in finder.stats.items()})
+        emp, named = [], []
+        for r in rows:
+            lead = EmployerLead(name=r.name, employer_type=r.employer_type, contact_name=r.contact_name,
+                                contact_role=r.contact_role, address=r.address, postcode=r.postcode,
+                                distance_miles=r.distance, phone=r.phone, email=r.email, website=r.website,
+                                source=r.source, source_url=r.source_url, ods_code=r.ods_code, lat=r.lat, lon=r.lon,
+                                note=("Named in an official register - a professional at this workplace, not a "
+                                      "job-seeker" if r.named_person else "Employer - not a candidate"))
+            (named if r.named_person else emp).append(lead)
+        return emp, named
+
     # --- both ------------------------------------------------------------------------------------------------
     def find(self, title: str, place: Place, radius_miles: float, entries: Iterable[str] = (),
              progress: Callable[[str], None] = lambda m: None) -> tuple[list[EmployerLead], int]:
@@ -366,9 +402,16 @@ class EmployerLeadsFinder:
         # Overpass: nearest few miles only (a 15-mile query in London returns thousands and times out)
         osm = self.osm_leads(kinds, place, min(radius_miles, self.osm_radius), progress)
         leads = merge_leads(ods, osm)
+        named: list[EmployerLead] = []
+        if self.registers:
+            reg_emp, named = self.register_leads(kinds, title, place, radius_miles, progress)
+            leads = merge_leads(leads, reg_emp)
         leads, n = suppress_leads(leads, entries)
+        named, n2 = suppress_leads(named, entries)
+        n += n2
         leads.sort(key=lambda l: (l.distance_miles is None, l.distance_miles or 0, l.name))
-        leads = leads[: self.max_leads]
+        named.sort(key=lambda l: (l.distance_miles is None, l.distance_miles or 0, l.name))
+        leads = leads[: self.max_leads] + named[: self.max_named]
         self.stats.update(with_phone=sum(1 for l in leads if l.phone), with_website=sum(1 for l in leads if l.website),
                           with_email=sum(1 for l in leads if l.email))
         return leads, n

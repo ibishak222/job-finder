@@ -50,8 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "correspondence email in their own author affiliation in recent Europe PMC articles (off by "
                         "default; research contacts - PECR/consent applies before emailing them)")
     p.add_argument("--no-employers", action="store_true",
-                   help="healthcare/care jobs: don't list employers to contact (GP practices, care homes …) from "
-                        "NHS ODS and OpenStreetMap")
+                   help="care/health/chef/teacher/barrister searches: don't list employers to contact from "
+                        "official registers (CQC, Care Inspectorate, NHS ODS, FSA, GIAS, Charity Commission, BSB) "
+                        "and OpenStreetMap")
     p.add_argument("--near-only", action="store_true",
                    help="leave out UK-based Bluesky/Mastodon people who don't name a town near the postcode")
     p.add_argument("--no-websites", action="store_true",

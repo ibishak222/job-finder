@@ -24,7 +24,7 @@ from .employers import EmployerLead, EmployerLeadsFinder, employer_kinds
 PEOPLE_SOURCES = ("github", "bluesky", "mastodon", "openstreetmap")
 SOURCE_LABELS = {"contacts": "Contact check (links on their profiles)", "github": "GitHub", "bluesky": "Bluesky", "mastodon": "Mastodon", "job_ads": "Hiring contacts",
                  "openstreetmap": "OpenStreetMap businesses", "team_pages": "Team pages",
-                 "europepmc": "Clinical researchers (Europe PMC)", "employers": "Employers to contact (NHS ODS + OpenStreetMap)"}
+                 "europepmc": "Clinical researchers (Europe PMC)", "employers": "Employers to contact (official registers + OpenStreetMap)"}
 CONTRACT_CHOICES = {"any": "Any", "permanent": "Permanent", "temporary": "Locum / temp / contract"}
 
 log = logging.getLogger(__name__)
@@ -477,9 +477,12 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
         result.reports.append(rep)
         if result.employers:
             kinds = ", ".join(dict.fromkeys(l.employer_type for l in result.employers))
+            srcs = ", ".join(dict.fromkeys(s.strip() for l in result.employers for s in l.source.split("+") if s.strip()))
+            named = sum(1 for l in result.employers if l.contact_name)
             result.employers_note = (f"{len(result.employers)} employers near {place.town} that hire this kind of "
-                                     f"worker ({kinds}) - organisations to approach, not candidates. Business "
-                                     "contact details from NHS ODS and OpenStreetMap.")
+                                     f"worker ({kinds}) - organisations to approach, not candidates"
+                                     + (f"; {named} name a professional from the register (not job-seekers)"
+                                        if named else "") + f". Contact details from {srcs or 'NHS ODS'}.")
     return result
 
 

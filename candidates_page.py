@@ -55,9 +55,12 @@ GDPR_TEXT = """
 * **Message links:** for people without an email, the *Message* column links to their own Bluesky / Mastodon
   profile so you can message them there yourself. Nothing is sent automatically; follow each site's rules and
   don't send bulk messages.
-* **Employers to contact** (healthcare and care jobs): GP practices, care homes, home-care agencies and similar
-  near the postcode, from the NHS Organisation Data Service (open data, OGL) and OpenStreetMap (ODbL). These are
-  **organisations, not candidates**; contact details are the business ones they published.
+* **Employers to contact** (care, health, kitchen, school and family-law/barrister searches): GP practices, care
+  homes, home-care agencies, restaurants, schools, chambers and similar near the postcode, from official open-data
+  registers - CQC, Care Inspectorate, NHS ODS, FSA food hygiene, DfE GIAS, Charity Commission, Bar Standards Board
+  (all OGL) - and OpenStreetMap (ODbL). These are **organisations, not candidates**. Some rows also name a
+  professional *from the register* (a registered manager, nurse prescriber, headteacher or barrister): they are
+  **not job-seekers**, and the register is shown as the source.
 * **CV databases:** for UK jobseekers who have opted in to be contacted, the proper route is a paid recruiter account
   on Reed, Totaljobs or CV-Library CV search.
 """
@@ -180,11 +183,12 @@ def candidates_page():
                        "API, a couple of requests). Only addresses that belong to that author are kept, with the "
                        "article as the source. Published for research correspondence, not recruitment: PECR "
                        "consent / soft opt-in applies before emailing them.")
-        st.toggle("Employers to contact (GP practices, care homes…)", key="c_emp",
-                  help="Healthcare and care jobs only: GP practices, care homes, home-care agencies, dental "
-                       "practices, pharmacies or hospitals near the postcode from the NHS Organisation Data Service "
-                       "and OpenStreetMap, with their published phone / website. Shown separately - organisations, "
-                       "not candidates.")
+        st.toggle("Employers to contact (GP practices, care homes, schools…)", key="c_emp",
+                  help="Care, health, chef/kitchen, teacher and barrister/family-law searches: employers near the "
+                       "postcode from official registers (CQC, Care Inspectorate, NHS ODS, FSA, DfE GIAS, Charity "
+                       "Commission, Bar Standards Board) and OpenStreetMap, with their published phone / website / "
+                       "email. Shown separately - organisations and register-named professionals, not candidates. "
+                       "The first search in an area downloads the registers (up to ~2 minutes); then cached 7 days.")
         st.toggle("Also show UK people who don't name a nearby town", key="c_uk_unknown",
                   help="Bluesky/Mastodon people whose bio matches the job and is clearly UK-based (e.g. mentions the "
                        "NHS, 'UK', a UK body like the NMC/SRA, or has a .uk handle) but doesn't name a town near the "
@@ -499,18 +503,22 @@ def _results() -> None:
                f"{int(st.session_state.get('c_retention', 30))} days.")
 
 
-EMPLOYER_COLUMNS = {"name": "Employer", "employer_type": "Type", "distance_miles": "Miles away", "address": "Address",
+EMPLOYER_COLUMNS = {"name": "Employer", "employer_type": "Type", "contact_name": "Named in register",
+                    "contact_role": "Their role (register)", "distance_miles": "Miles away", "address": "Address",
                     "postcode": "Postcode", "phone": "Phone", "email": "Email", "website": "Website",
                     "source": "Source", "source_url": "Source record", "ods_code": "NHS ODS code", "note": "Note"}
-EMPLOYER_NOTICE = ("Employers to contact - organisations that employ this kind of worker, NOT candidates. Business "
-                   "contact details from the NHS Organisation Data Service (Open Government Licence) and "
-                   "OpenStreetMap (© OpenStreetMap contributors, ODbL).")
+EMPLOYER_NOTICE = ("Employers to contact - organisations that employ this kind of worker, NOT candidates. People named "
+                   "here come from an official register (registered manager, nurse prescriber, headteacher, "
+                   "barrister) and are NOT job-seekers. Sources: CQC, Care Inspectorate, NHS Organisation Data "
+                   "Service, Food Standards Agency, DfE GIAS, Charity Commission (all Open Government Licence v3.0), "
+                   "Bar Standards Board Barristers' Register, OpenStreetMap (© OpenStreetMap contributors, ODbL). "
+                   "Respect each person's objection to contact; UK GDPR/PECR apply.")
 
 
 def _emp_frame(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=EmployerLead.field_names())
-    for c in ("name", "employer_type", "address", "postcode", "phone", "email", "website", "source", "source_url",
-              "ods_code", "note"):
+    for c in ("name", "employer_type", "contact_name", "contact_role", "address", "postcode", "phone", "email",
+              "website", "source", "source_url", "ods_code", "note"):
         df[c] = df[c].fillna("")
     return df
 
@@ -536,21 +544,33 @@ def _employers() -> None:
     df = _emp_frame(rows)
     st.divider()
     st.subheader(f"🏥 Employers to contact ({len(df)})")
+    n_named = int((df["contact_name"] != "").sum())
     st.caption("**Organisations, not candidates**: places near the postcode that employ this kind of worker - ask "
                "about vacancies, agency/bank staff or referrals. " + (st.session_state.get("cand_emp_note") or ""))
     kinds = ["All"] + list(dict.fromkeys(df["employer_type"]))
     pick = st.radio("Type", kinds, horizontal=True, key="c_emp_type")
     view = df if pick == "All" else df[df["employer_type"] == pick]
     view = view.reset_index(drop=True)
-    st.dataframe(view[["name", "employer_type", "distance_miles", "phone", "website", "email", "address", "postcode",
-                       "source", "source_url"]], hide_index=True, width="stretch",
+    cols = ["name", "employer_type"] + (["contact_name", "contact_role"] if n_named else []) + [
+        "distance_miles", "phone", "website", "email", "address", "postcode", "source", "source_url"]
+    if n_named:
+        st.caption(f"**{n_named}** rows name a professional from an official register (registered manager, nurse "
+                   "prescriber, headteacher, barrister) - **not job-seekers**. Approach them as employers / for "
+                   "referrals, and stop if they object.")
+    st.dataframe(view[cols], hide_index=True, width="stretch",
                  height=min(460, 38 + 35 * len(view)), key="emp_table", column_config={
                      "name": st.column_config.TextColumn("Employer", pinned=True), "employer_type": "Type",
+                     "contact_name": st.column_config.TextColumn("Named in register",
+                                                                 help="From the official register - not a job-seeker"),
+                     "contact_role": "Their role (register)",
                      "distance_miles": st.column_config.NumberColumn("Miles away", format="%.1f"),
                      "phone": "Phone", "website": st.column_config.LinkColumn("Website"), "email": "Email",
                      "address": st.column_config.TextColumn("Address", width="large"), "postcode": "Postcode",
                      "source": "Source", "source_url": st.column_config.LinkColumn("Source record",
                                                                                    display_text="Record ↗")})
-    st.caption("Data: NHS Organisation Data Service (Open Government Licence v3.0) · © "
-               "[OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, ODbL.")
+    from recruit_scraper.candidates.registers import LICENCES
+    used = [v for k, v in LICENCES.items() if df["source"].str.contains(k, regex=False).any()]
+    if df["source"].str.contains("OpenStreetMap", regex=False).any():
+        used.append("© [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, ODbL")
+    st.caption("Data: " + " · ".join(used or ["NHS Organisation Data Service (Open Government Licence v3.0)"]) + ".")
     export_panel("emps", view, df, "employers", emp_exports(st.session_state.get("cand_meta", "")))
