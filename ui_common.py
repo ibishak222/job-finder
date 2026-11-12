@@ -211,13 +211,30 @@ def tip(key: str, text: str) -> None:
         b.button("✕", key=f"tipbtn_{key}", help="Hide this tip", on_click=lambda: st.session_state.update({flag: True}))
 
 
-STICKY_CSS = """
-<style>
-div[class*="st-key-sticky_"] {position: sticky; top: 3.5rem; z-index: 50; background: var(--background-color, #fff);
-  padding: .35rem .5rem; border-bottom: 1px solid rgba(49,51,63,.15); border-radius: .4rem;}
-div[class*="st-key-sticky_"] [data-testid="stMetricValue"] {font-size: 1.5rem;}
-</style>
-"""
+STICKY_CSS = ""   # kept for compatibility: the stylesheet now lives in ui_theme.CSS (injected once by app.py)
+
+
+def pager(key: str, signature: str, total: int, step: int = 20) -> int:
+    """How many cards to show now. 'Show more' (see more_button) raises it; a new search / filter resets it."""
+    import streamlit as st
+    state = st.session_state.get(key)
+    if not state or state[0] != signature:
+        state = (signature, step)
+        st.session_state[key] = state
+    return min(state[1], total)
+
+
+def more_button(key: str, shown: int, total: int, step: int = 20, noun: str = "results") -> None:
+    import streamlit as st
+    if shown >= total:
+        st.caption(f"Showing all {total} {noun}.")
+        return
+
+    def more():
+        sig, n = st.session_state[key]
+        st.session_state[key] = (sig, n + step)
+    st.button(f"Show {min(step, total - shown)} more ({shown} of {total} shown)", key=f"{key}_more", on_click=more,
+              width="stretch")
 
 
 def export_panel(key: str, shown: pd.DataFrame, everything: pd.DataFrame, noun: str, build: dict) -> None:
@@ -229,35 +246,56 @@ def export_panel(key: str, shown: pd.DataFrame, everything: pd.DataFrame, noun: 
 
     filtered = len(shown) != len(everything)
     scope = "shown"
-    if filtered:
-        scope = st.radio("What to export", ["shown", "all"], horizontal=True, key=f"{key}_scope",
-                         format_func=lambda s: f"Rows shown ({len(shown)})" if s == "shown"
-                         else f"All results ({len(everything)})")
-    data = shown if scope == "shown" else everything
-    n = len(data)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    base = f"{noun}_{stamp}" + ("" if scope == "all" or not filtered else "_filtered")
+    with st.container(border=True, key=f"{key}_export"):
+        st.markdown("**⬇️ Download these results**")
+        if filtered:
+            scope = st.radio("What to export", ["shown", "all"], horizontal=True, key=f"{key}_scope",
+                             format_func=lambda s: f"Rows shown ({len(shown)})" if s == "shown"
+                             else f"All results ({len(everything)})")
+        data = shown if scope == "shown" else everything
+        n = len(data)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        base = f"{noun}_{stamp}" + ("" if scope == "all" or not filtered else "_filtered")
 
-    def done(fmt):
-        st.session_state[f"{key}_last_download"] = f"Downloaded {n} {noun} as {fmt}"
+        def done(fmt):
+            st.session_state[f"{key}_last_download"] = f"Downloaded {n} {noun} as {fmt}"
 
-    cols = st.columns(3)
-    specs = [("Excel (.xlsx)", "excel", "xlsx", XLSX_MIME, "primary"),
-             ("CSV", "csv", "csv", "text/csv", "secondary"),
-             ("JSON", "json", "json", "application/json", "secondary")]
-    for col, (label, fmt, ext, mime, kind) in zip(cols, specs):
-        fn = build[fmt]
-        col.download_button(f"⬇️ {label} · {n} rows", data=(lambda fn=fn, d=data: fn(d)), file_name=f"{base}.{ext}",
-                            mime=mime, key=f"{key}_dl_{fmt}", type=kind, width="stretch", disabled=n == 0,
-                            on_click=done, args=(label.split(" ")[0],))
-    msg = st.session_state.pop(f"{key}_last_download", None)
-    if msg:
-        st.toast("✅ " + msg)
-        st.success("✅ " + msg + " – check your browser's downloads.")
+        cols = st.columns(3)
+        specs = [("Excel (.xlsx)", "excel", "xlsx", XLSX_MIME, "primary"),
+                 ("CSV", "csv", "csv", "text/csv", "secondary"),
+                 ("JSON", "json", "json", "application/json", "secondary")]
+        for col, (label, fmt, ext, mime, kind) in zip(cols, specs):
+            fn = build[fmt]
+            col.download_button(f"⬇️ {label} · {n} rows", data=(lambda fn=fn, d=data: fn(d)), file_name=f"{base}.{ext}",
+                                mime=mime, key=f"{key}_dl_{fmt}", type=kind, width="stretch", disabled=n == 0,
+                                on_click=done, args=(label.split(" ")[0],))
+        msg = st.session_state.pop(f"{key}_last_download", None)
+        if msg:
+            st.toast("✅ " + msg)
+            st.success("✅ " + msg + " – check your browser's downloads.")
 
 
-def show_running(task_key: str, title: str) -> None:
-    """Live progress box for a background search; refreshes every second and reloads the page when finished."""
+_NOISE = re.compile(r"^\s*$")
+
+
+def stage_html(lines: list[str], limit: int = 7) -> str:
+    """The recent stages of a search as a checklist: finished ones greyed, the current one highlighted."""
+    from ui_theme import esc
+    seen: list[str] = []
+    for l in lines:
+        t = re.sub(r"<[^>]+>", "", str(l)).strip()
+        if t and not _NOISE.match(t) and (not seen or seen[-1] != t):
+            seen.append(t)
+    seen = seen[-limit:]
+    items = [f'<li class="{"now" if i == len(seen) - 1 else "done"}">{"⏳" if i == len(seen) - 1 else "✓"} {esc(t[:150])}</li>'
+             for i, t in enumerate(seen)]
+    return f'<ul class="jf-steps">{"".join(items)}</ul>' if items else ""
+
+
+def show_running(task_key: str, title: str, expected_seconds: float = 0) -> None:
+    """Live progress box for a background search; refreshes every second and reloads the page when finished.
+
+    Shows each stage as it happens. expected_seconds > 0 drives the bar for searches that can't count their steps."""
     import streamlit as st
 
     @st.fragment(run_every=1.0)
@@ -266,17 +304,22 @@ def show_running(task_key: str, title: str) -> None:
         if t is None or not t.running:
             st.rerun()
             return
-        with st.container(border=True):
+        elapsed = int(time.time() - t.started)
+        frac = t.progress
+        if not frac and expected_seconds:
+            frac = min(0.95, elapsed / expected_seconds)
+        with st.container(border=True, key=f"{task_key}_running"):
             a, b = st.columns([5, 1])
-            a.progress(min(max(t.progress, 0.02), 1.0),
-                       text=f"⏳ {title} – {int(time.time() - t.started)}s so far. You can keep using the page.")
+            a.progress(min(max(frac, 0.03), 1.0),
+                       text=f"⏳ {title} · {elapsed}s so far. You can keep using the page.")
 
             def cancel():
                 t.cancel.set()
                 t.status = "cancelled"
             b.button("✖ Cancel", key=f"{task_key}_cancel", on_click=cancel, width="stretch")
-            for line in t.log[-6:]:
-                st.markdown(f"<small>{line}</small>", unsafe_allow_html=True)
+            html_ = stage_html(list(t.log))
+            if html_:
+                st.markdown(html_, unsafe_allow_html=True)
     live()
 
 
