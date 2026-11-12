@@ -279,5 +279,5 @@ def default_sources(companies: list[str], urls: list[str]) -> list[str]:
         selected += [s for s in ("greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee")
                      if s in prefixed or (not prefixed and s in ("greenhouse", "lever", "ashby"))]
     if urls:
-        selected.append("jsonld")
+        selected += ["jsonld", "rss"]
     return selected + ["reed", "adzuna"]

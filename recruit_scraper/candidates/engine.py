@@ -55,6 +55,9 @@ class CandidateResult:
     employers_note: str = ""
 
 
+EMPLOYER_DEADLINE_SECONDS = 110.0   # whole-search target; the employer stage is cut to fit (partial lists, noted)
+
+
 def _is_bluesky(u: str) -> bool:
     return "bsky.app/profile/" in (u or "")
 
@@ -310,6 +313,7 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
             if cancel.is_set():
                 raise SearchCancelled("search cancelled")
             _report(m)
+    t_start = time.monotonic()
     http = HttpClient(min_interval=delay)
     pc_http = HttpClient(min_interval=0.1)  # postcodes.io is a free public service; light but polite
     result = CandidateResult()
@@ -467,6 +471,8 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
     result.candidates = uniq
     if employers and employer_kinds(title):
         finder = EmployerLeadsFinder()
+        # hard budget: the whole search aims at ~2 minutes, so the employer stage gets what the people search left
+        finder.budget_seconds = max(45.0, EMPLOYER_DEADLINE_SECONDS - (time.monotonic() - t_start))
         rep = ProviderReport("employers", "ok")
         try:
             result.employers, n = finder.find(title, place, radius_miles, entries, progress)

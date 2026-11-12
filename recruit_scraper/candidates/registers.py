@@ -211,7 +211,7 @@ def stream_zip_member(http: HttpClient, url: str, budget: _Budget, encoding: str
             with http.session.get(url, stream=True, timeout=(15, 30)) as r:
                 r.raise_for_status()
                 n = 0
-                for chunk in r.iter_content(1 << 20):
+                for chunk in r.iter_content(1 << 16):   # small chunks: the time budget is checked often, even on a slow link
                     n += len(chunk)
                     if n > MAX_BYTES:
                         raise RegisterUnavailable("file larger than expected - skipped")
@@ -276,21 +276,31 @@ class Register:
 
 CQC_TYPES = {"gp": ("Doctors/GPs",), "care_home": ("Residential homes", "Nursing homes"),
              "home_care": ("Homecare agencies", "Supported living", "Shared lives"), "dental": ("Dentist",),
-             "hospital": ("Hospital", "Hospice"), "clinic": ("Clinic", "Community services - Nursing",
+             "hospital": ("Hospital", "Hospice", "Home hospice care"), "clinic": ("Clinic", "Community services - Nursing",
                                                               "Community services - Healthcare"),
              "community": ("Community services - Nursing", "Community services - Healthcare"),
-             "urgent_care": ("Urgent care centres", "Mobile doctors")}
+             "urgent_care": ("Urgent care centres", "Mobile doctors"),
+             "mental_health": ("Hospitals - Mental health/capacity", "Community services - Mental Health",
+                               "Community services - Learning disabilities")}
+# CQC has no 'nurses agency' service type: nurse / staffing agencies are registered as homecare agencies, so they are
+# recognised by name (used for locum / bank searches)
+NURSE_AGENCY_NAME = re.compile(r"\bnurs(e|es|ing)\b|staffing|locum|recruit|relief|medical (staff|personnel)|"
+                               r"healthcare (staff|personnel|professionals)|personnel|agency", re.I)
 CQC_LABEL = {"Doctors/GPs": "GP practice", "Residential homes": "Care home", "Nursing homes": "Nursing home",
              "Homecare agencies": "Home care agency", "Supported living": "Supported living service",
              "Shared lives": "Shared lives scheme", "Dentist": "Dental practice", "Hospital": "Hospital",
              "Hospice": "Hospice", "Clinic": "Clinic", "Community services - Nursing": "Community nursing service",
              "Community services - Healthcare": "Community health service",
-             "Urgent care centres": "Urgent care / walk-in centre", "Mobile doctors": "Out-of-hours GP service"}
+             "Urgent care centres": "Urgent care / walk-in centre", "Mobile doctors": "Out-of-hours GP service",
+             "Hospitals - Mental health/capacity": "Mental health hospital",
+             "Community services - Mental Health": "Community mental health service",
+             "Community services - Learning disabilities": "Learning disability service",
+             "Home hospice care": "Hospice (home care)"}
 
 
 class CQCDirectory(Register):
     key, label, kinds = "cqc", "CQC", {"gp", "care_home", "home_care", "dental", "hospital", "clinic", "community",
-                                       "urgent_care"}
+                                       "urgent_care", "mental_health", "nurse_agency"}
 
     def download(self, http, keep, budget):
         url = latest_link(http, CQC_PAGE, r'href="(https://www\.cqc\.org\.uk/system/files/[^"]+CQC_directory\.csv)"')
@@ -315,6 +325,9 @@ class CQCDirectory(Register):
     def wanted(self, row, kinds, title):
         types = row.tags.split("|")
         hit = next((t for k in kinds for t in CQC_TYPES.get(k, ()) if t in types), None)
+        if not hit and "nurse_agency" in kinds and "Homecare agencies" in types and NURSE_AGENCY_NAME.search(row.name):
+            row.employer_type = "Nurse / staffing agency"
+            return True
         if hit:
             row.employer_type = CQC_LABEL.get(hit, hit)   # label by the service type that matched the role
         return bool(hit)

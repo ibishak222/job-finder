@@ -9,13 +9,17 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from dataclasses import asdict
 from typing import Optional
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
+from ..crawl import classify_links, discover_feeds, matching_vacancies, parse_feed, vacancy_items
 from ..http import HttpClient, RobotsDisallowed
+from ..models import Job
 from ..utils import find_emails
 from .cache import DiskCache
 
@@ -40,6 +44,21 @@ def normalise_url(url: str) -> Optional[str]:
     if not p.netloc or "." not in p.netloc:
         return None
     return url
+
+
+_TEMP_SEARCH = re.compile(r"\b(locum|bank|sessional|agency|ad[- ]?hoc|temp(orary)?|relief|flexi|per diem)\b", re.I)
+
+
+def vacancy_type(job: Job) -> str:
+    """'locum / bank / temporary' when the ad (title, start of the text, contract type) says so, else 'permanent / other'."""
+    from .matching import CONTRACT_TEMP
+    hay = f"{job.title}\n{(job.description or '')[:800]}\n{job.employment_type or ''}".lower()
+    return "locum / bank / temporary" if CONTRACT_TEMP.search(hay) else "permanent / other"
+
+
+def _same_host(a: str, b: str) -> bool:
+    ha, hb = _host(a), _host(b)
+    return ha == hb or ha.endswith("." + hb) or hb.endswith("." + ha)
 
 
 def _host(url: str) -> str:
@@ -84,31 +103,74 @@ def parse_page(html: str, base_url: str) -> dict:
                 linkedin = _LINKEDIN.match(full).group(0)
             elif not twitter and _TWITTER.match(full):
                 twitter = full
-    for tag in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
-        try:
-            data = json.loads(tag.string or "")
-        except Exception:  # noqa: BLE001
-            continue
-        for d in (data if isinstance(data, list) else data.get("@graph", [data]) if isinstance(data, dict) else []):
-            if isinstance(d, dict) and str(d.get("@type", "")).split("/")[-1] in ("Person", "Organization", "ProfilePage"):
-                ent = d.get("mainEntity") if isinstance(d.get("mainEntity"), dict) else d
-                for e in find_emails(str(ent.get("email") or "").replace("mailto:", "")):
+    for ent in _schema_entities(html, base_url, soup):
+        for e in find_emails(str(ent.get("email") or "").replace("mailto:", "")):
+            if e not in emails:
+                emails.append(e)
+        tel = ent.get("telephone")
+        if tel and str(tel) not in phones:
+            phones.append(str(tel))
+        for cp in ent.get("contactPoint") or []:
+            if isinstance(cp, dict):
+                for e in find_emails(str(cp.get("email") or "").replace("mailto:", "")):
                     if e not in emails:
                         emails.append(e)
-                tel = ent.get("telephone")
-                if tel and str(tel) not in phones:
-                    phones.append(str(tel))
-                for same in ent.get("sameAs") or []:
-                    if not linkedin and _LINKEDIN.match(str(same)):
-                        linkedin = str(same)
+                if cp.get("telephone") and str(cp["telephone"]) not in phones:
+                    phones.append(str(cp["telephone"]))
+        for same in ent.get("sameAs") or []:
+            if not linkedin and _LINKEDIN.match(str(same)):
+                linkedin = str(same)
     for s in soup(["script", "style", "noscript"]):
         s.decompose()
     text = soup.get_text(" ")
     for e in find_emails(text):
         if e not in emails:
             emails.append(e)
-    return {"emails": emails, "phones": clean_phones(phones, text), "linkedin": linkedin, "twitter": twitter,
-            "managers": practice_managers(text)}
+    out = {"emails": emails, "phones": clean_phones(phones, text), "linkedin": linkedin, "twitter": twitter,
+           "managers": practice_managers(text)}
+    out.update({f"{k}_links": v for k, v in classify_links(html, base_url).items()})
+    return out
+
+
+# schema.org types that describe a thing rather than the organisation / person publishing the page
+_NOT_ENTITY = {"jobposting", "event", "product", "offer", "website", "webpage", "breadcrumblist", "article",
+               "blogposting", "newsarticle", "imageobject", "searchaction", "listitem", "itemlist", "review",
+               "aggregaterating", "question", "answer", "faqpage", "postaladdress", "place", "geocoordinates"}
+
+
+def _schema_entities(html: str, base_url: str, soup: BeautifulSoup) -> list[dict]:
+    """schema.org entities with a public phone / email: any Organization or LocalBusiness subtype (MedicalClinic,
+    Electrician, AccountingService, Restaurant, ...) or Person, from JSON-LD (lenient: raw newlines / trailing commas) and
+    microdata (extruct). Page-level `mainEntity` of a ProfilePage is unwrapped."""
+    from ..sources.jsonld import _loads_lenient, _walk
+    found: list[dict] = []
+    for tag in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+        try:
+            data = _loads_lenient(tag.string or tag.get_text() or "")
+        except Exception:  # noqa: BLE001
+            continue
+        found.extend(d for d in _walk(data))
+    try:
+        import extruct
+        md = extruct.extract(html, base_url=base_url, syntaxes=["microdata"], uniform=True, errors="ignore")
+        for item in md.get("microdata") or []:
+            found.extend(_walk(item))
+    except Exception as e:  # noqa: BLE001 - extruct is optional and must never break a page read
+        log.debug("extruct microdata failed: %s", e)
+    out: list[dict] = []
+    for d in found:
+        t = d.get("@type")
+        types = [str(x).split("/")[-1].lower() for x in (t if isinstance(t, list) else [t]) if x]
+        if types and all(x in _NOT_ENTITY for x in types):
+            continue
+        ent = d.get("mainEntity") if isinstance(d.get("mainEntity"), dict) else d
+        cps = ent.get("contactPoint")
+        ent = {**ent, "contactPoint": cps if isinstance(cps, list) else [cps] if cps else []}
+        sa = ent.get("sameAs")
+        ent["sameAs"] = sa if isinstance(sa, list) else [sa] if sa else []
+        if ent.get("email") or ent.get("telephone") or ent["contactPoint"] or ent["sameAs"]:
+            out.append(ent)
+    return out
 
 
 _NAME = r"((?:Mrs|Mr|Ms|Miss|Dr)\.?\s+)?([A-Z][a-z'’\-]+(?:\s+[A-Z][a-z'’\-]+){1,2})"
@@ -182,10 +244,15 @@ class SiteContactFinder:
         self.http = http
         self.cache = DiskCache("sites", cache_ttl_days * 86400)
 
-    def _fetch(self, url: str) -> Optional[dict]:
-        cached = self.cache.get(url)
+    deadline: Optional[float] = None    # time.monotonic() after which no more pages are fetched (search time budget)
+
+    def _fetch(self, url: str, careers: bool = False) -> Optional[dict]:
+        key = url + ("#careers" if careers else "")
+        cached = self.cache.get(key)
         if cached is not None:
             return cached or None
+        if self.deadline is not None and time.monotonic() > self.deadline:
+            return None                 # out of search time: no more page requests
         out: dict = {}
         try:
             r = self.http.get(url, check_robots=True, headers={"Accept": "text/html,application/xhtml+xml"})
@@ -196,12 +263,15 @@ class SiteContactFinder:
                 else:
                     out = parse_page(r.text, r.url)
                     out["url"] = r.url
+                    if careers:
+                        out["vacancies"] = [asdict(j) for j in vacancy_items(r.text, r.url)]
+                        out["feeds"] = discover_feeds(r.text, r.url)[:2]
         except RobotsDisallowed:
             out = {"skipped": "robots.txt"}
         except requests.RequestException as e:
             log.debug("site fetch failed %s: %s", url, e)
             return None  # don't cache network failures
-        self.cache.set(url, out)
+        self.cache.set(key, out)
         return out or None
 
     def personal(self, site_url: str) -> dict:
@@ -272,6 +342,103 @@ class SiteContactFinder:
             if res["emails"] and res["managers"]:
                 break
         return res
+
+    def employer(self, site_url: str, keyword: Optional[str] = None, max_careers: int = 2) -> dict:
+        """What an employer publishes on its OWN website (any trade or profession): contact email(s) on its own domain (or an
+        NHS / HSC address), phone, the manager it names, the careers / vacancies page linked from its site, and any open
+        vacancy there whose title fits `keyword`. Contact pages are found from the links on the homepage ('Contact us',
+        'Get in touch'), then the usual paths; robots.txt and noindex are respected and every page is cached."""
+        url = normalise_url(site_url)
+        res = {"emails": [], "phones": [], "managers": [], "source_url": None, "note": "", "careers_url": "",
+               "vacancies": [], "pages": 0, "bank_url": ""}
+        if not url or is_no_fetch(url):
+            return res
+        host = _host(url)
+        base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        home = self._fetch(url)
+        if not home:
+            return res
+        if home.get("skipped"):
+            res["note"] = f"skipped ({home['skipped']})"
+            return res
+        contact_links = list(home.get("contact_links") or [])
+        careers_links = list(home.get("careers_links") or [])
+        pages = [(url, home)]
+        self._collect(res, home, url, host)
+        fallback = [urljoin(base, p) for p in ("/contact-us", "/contact")] if not contact_links else []
+        for page in contact_links[:2] + fallback + [urljoin(base, "/practice-staff")]:
+            if len(pages) >= 4 or (res["emails"] and res["managers"] and page != url):
+                break
+            if any(page.rstrip("/") == p.rstrip("/") for p, _ in pages):
+                continue
+            if page.endswith("/practice-staff") and res["managers"]:
+                continue
+            got = self._fetch(page)
+            if got and not got.get("skipped"):
+                pages.append((page, got))
+                self._collect(res, got, page, host)
+        res["pages"] = len(pages)
+        bank_links = list(home.get("bank_links") or [])
+        temporary = _TEMP_SEARCH.search(keyword or "") is not None
+        # locum / bank searches look at the 'join our bank' pages first, others at the careers pages first
+        links = (bank_links + careers_links) if temporary else (careers_links + bank_links)
+        for link in links:
+            if link in bank_links and not res["bank_url"]:
+                res["bank_url"] = link
+            if link in careers_links and not res["careers_url"]:
+                res["careers_url"] = link
+            if len(res["vacancies"]) >= 5 or max_careers <= 0:
+                if res["careers_url"] and (res["bank_url"] or not bank_links):
+                    break
+                continue
+            if not _same_host(link, url):
+                continue            # a job platform the employer links to: recorded, but not crawled from here
+            got = self._fetch(link, careers=True)
+            max_careers -= 1
+            if not got or got.get("skipped"):
+                continue
+            res["pages"] += 1
+            self._collect(res, got, link, host)
+            items = [Job(**{k: v for k, v in j.items() if k in Job.field_names()}) for j in got.get("vacancies") or []]
+            for b in got.get("bank_links") or []:
+                if not res["bank_url"]:
+                    res["bank_url"] = b
+            found = matching_vacancies(items, keyword)
+            if not found and got.get("feeds"):
+                found = self._feed_vacancies(got["feeds"][0], keyword)
+            for j in found:
+                res["vacancies"].append({"title": j.title, "url": j.url, "pay": j.salary_raw or "",
+                                         "closing_date": j.closing_date or "", "page": got.get("url") or link,
+                                         "type": vacancy_type(j)})
+        return res
+
+    def _feed_vacancies(self, feed_url: str, keyword: Optional[str]) -> list[Job]:
+        """Vacancies in an RSS / Atom feed a careers page advertises (read with our client: robots.txt, rate limit)."""
+        if self.http is None:
+            return []
+        try:
+            r = self.http.get(feed_url, check_robots=True, headers={"Accept": "application/rss+xml, application/atom+xml, */*"})
+            return matching_vacancies(parse_feed(r.content, feed_url, source="site"), keyword)
+        except (RobotsDisallowed, requests.RequestException, ImportError, ValueError) as e:
+            log.debug("feed %s failed: %s", feed_url, e)
+            return []
+
+    @staticmethod
+    def _collect(res: dict, got: dict, page: str, host: str) -> None:
+        for e in got.get("emails", []):
+            dom = e.rsplit("@", 1)[-1].lower()
+            own = dom == host or dom.endswith("." + host) or host.endswith("." + dom)
+            if find_emails(e) and (own or _NHS_MAIL.search(e)) and e not in res["emails"]:
+                res["emails"].append(e)
+                res["source_url"] = res["source_url"] or got.get("url") or page
+        for p in got.get("phones", []):
+            if p not in res["phones"]:
+                res["phones"].append(p)
+                res["source_url"] = res["source_url"] or got.get("url") or page
+        for name, role in got.get("managers") or []:
+            if name not in [m[0] for m in res["managers"]]:
+                res["managers"].append((name, role))
+                res["source_url"] = res["source_url"] or got.get("url") or page
 
     def company(self, domain: str) -> list[tuple[str, str]]:
         """Recruiting role addresses (careers@, jobs@, talent@ …) a company publishes on its own site."""

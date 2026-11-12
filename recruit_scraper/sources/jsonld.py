@@ -214,6 +214,7 @@ def jobposting_to_job(jp: dict, page_url: str, source: str = "jsonld") -> Job:
         employment_type=normalise_employment_type(jp.get("employmentType")),
         remote=remote,
         contact_email=find_email(desc),
+        closing_date=to_iso_date(str(jp.get("validThrough"))[:10]) if jp.get("validThrough") else None,
     )
     sal = _salary(jp) or find_salary_in_text(desc)
     if sal:
@@ -252,6 +253,19 @@ class JsonLdSource(Source):
                 links.append(href)
         return links
 
+    @staticmethod
+    def _text_job(html: str, url: str, host: str) -> Optional[Job]:
+        """A vacancy page with no schema.org data (most small employers): the title from the page heading, the ad text from
+        the page's main content (trafilatura), so menus and cookie banners are left out. Only pages that look like a
+        single job ad (a heading plus real text) count."""
+        from ..crawl import page_text, page_title
+        title, text = page_title(html), page_text(html, url)
+        if not title or len(text) < 200 or len(title.split()) > 14:
+            return None
+        return Job(title=title, company=host.removeprefix("www."), url=url, source=f"jsonld:{host}",
+                   description=text[:6000], contact_email=find_email(text),
+                   employment_type=None)
+
     def fetch(self) -> Iterator[Job]:
         for url in self.urls:
             html = self._fetch_html(url)
@@ -269,5 +283,10 @@ class JsonLdSource(Source):
                 sub = self._fetch_html(link)
                 if not sub:
                     continue
-                for jp in extract_jobpostings(sub, link):
+                found = extract_jobpostings(sub, link)
+                for jp in found:
                     yield jobposting_to_job(jp, link, source=f"jsonld:{host}")
+                if not found:
+                    job = self._text_job(sub, link, host)
+                    if job:
+                        yield job

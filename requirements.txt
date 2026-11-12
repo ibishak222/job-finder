@@ -14,3 +14,9 @@ Mastodon.py>=2.0,<3
 # better matching quality: fuzzy cross-site dedupe (rapidfuzz/RapidFuzz, MIT) and phone validation (daviddrysdale/python-phonenumbers, Apache-2.0)
 rapidfuzz>=3.9,<4
 phonenumbers>=8.13,<10
+# scraping helpers (all run on pages our own polite client fetched, so robots.txt / rate limits still apply):
+# Protego (scrapy/protego, BSD-3) reads robots.txt wildcard rules correctly; trafilatura (adbar/trafilatura, Apache-2.0) extracts the
+# main text of careers pages; feedparser (kurtmckee/feedparser, BSD-2) reads RSS / Atom job feeds
+protego>=0.3,<1
+trafilatura>=2.0,<3
+feedparser>=6.0,<7

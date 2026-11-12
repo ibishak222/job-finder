@@ -26,6 +26,11 @@ SOURCE_INFO = {
     "remoteok": ("Remote OK", "Popular remote-jobs board, mostly tech.", True),
     "arbeitnow": ("Arbeitnow", "Large job board, mostly Germany/EU plus remote roles.", True),
     "jsonld": ("Any careers page (paste links)", "Reads job details from careers pages you paste below.", True),
+    "rss": ("RSS / Atom job feeds (paste links)", "Reads vacancies from job feeds, or from careers pages that advertise "
+            "one (the same links box as 'Any careers page').", True),
+    "teachingvacancies": ("Teaching Vacancies (GOV.UK, England)", "Official DfE open data: teachers, teaching assistants, "
+                          "SENCOs, headteachers and school support staff at state schools, with pay and closing date. "
+                          "Used for school / education searches.", True),
     "nhsjobs": ("NHS Jobs (UK)", "NHS and NHS-funded jobs in England & Wales (nurses, HCAs, admin, doctors…). "
                 "Shows Permanent / Fixed-term / Bank / Locum. A locum / bank title asks for those contracts.", True),
     "nhsscotland": ("NHS Scotland Jobs", "NHS boards in Scotland (apply.jobs.scot.nhs.uk): staff bank, fixed-term and "

@@ -184,7 +184,7 @@ def candidates_page():
                        "article as the source. Published for research correspondence, not recruitment: PECR "
                        "consent / soft opt-in applies before emailing them.")
         st.toggle("Employers to contact (GP practices, care homes, schools…)", key="c_emp",
-                  help="Care, health, chef/kitchen, teacher and barrister/family-law searches: employers near the "
+                  help="Care, health, chef/kitchen, teacher, trades, accountant, solicitor and barrister searches: employers near the "
                        "postcode from official registers (CQC, Care Inspectorate, NHS ODS, FSA, DfE GIAS, Charity "
                        "Commission, Bar Standards Board) and OpenStreetMap, with their published phone / website / "
                        "email. Shown separately - organisations and register-named professionals, not candidates. "
@@ -510,7 +510,10 @@ def _results() -> None:
 EMPLOYER_COLUMNS = {"name": "Employer", "employer_type": "Type", "contact_name": "Named in register",
                     "contact_role": "Their role (register)", "distance_miles": "Miles away", "address": "Address",
                     "postcode": "Postcode", "phone": "Phone", "email": "Email", "website": "Website",
-                    "source": "Source", "source_url": "Source record", "ods_code": "NHS ODS code", "note": "Note"}
+                    "vacancy": "Open vacancy (own website)", "vacancy_type": "Vacancy type", "vacancy_url": "Vacancy link",
+                    "bank_url": "Join the bank / locum page",
+                    "careers_url": "Careers page", "source": "Source", "source_url": "Source record",
+                    "ods_code": "NHS ODS code", "note": "Note"}
 EMPLOYER_NOTICE = ("Employers to contact - organisations that employ this kind of worker, NOT candidates. People named "
                    "here come from an official register (registered manager, nurse prescriber, headteacher, "
                    "barrister) and are NOT job-seekers. Sources: CQC, Care Inspectorate, NHS Organisation Data "
@@ -522,7 +525,7 @@ EMPLOYER_NOTICE = ("Employers to contact - organisations that employ this kind o
 def _emp_frame(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=EmployerLead.field_names())
     for c in ("name", "employer_type", "contact_name", "contact_role", "address", "postcode", "phone", "email",
-              "website", "source", "source_url", "ods_code", "note"):
+              "website", "source", "source_url", "ods_code", "note", "careers_url", "vacancy", "vacancy_url", "vacancy_type", "bank_url"):
         df[c] = df[c].fillna("")
     return df
 
@@ -531,7 +534,7 @@ def emp_exports(query: str) -> dict:
     def friendly(d):
         return d[[c for c in EMPLOYER_COLUMNS if c in d.columns]].rename(columns=EMPLOYER_COLUMNS)
     return {
-        "excel": lambda d: to_excel_bytes(friendly(d), "Employers", link_cols=("Website", "Source record"),
+        "excel": lambda d: to_excel_bytes(friendly(d), "Employers", link_cols=("Website", "Source record", "Vacancy link", "Careers page", "Join the bank / locum page"),
                                           wide_cols={"Employer": 36, "Address": 44, "Source record": 50},
                                           notice_sheet=("About", [EMPLOYER_NOTICE])),
         "csv": lambda d: to_csv_bytes(friendly(d)),
@@ -555,8 +558,17 @@ def _employers() -> None:
     pick = st.radio("Type", kinds, horizontal=True, key="c_emp_type")
     view = df if pick == "All" else df[df["employer_type"] == pick]
     view = view.reset_index(drop=True)
+    n_vac = int((df["vacancy"] != "").sum())
+    n_car = int((df["careers_url"] != "").sum())
+    n_bank = int((df["bank_url"] != "").sum())
+    n_loc = int((df["vacancy_type"] == "locum / bank / temporary").sum())
+    if n_vac or n_car or n_bank:
+        st.caption(f"**{n_vac}** advertise this role on their own website right now (listed first; **{n_loc}** of them "
+                   f"locum / bank / temporary), **{n_car}** have a careers page and **{n_bank}** a 'join our bank' / locum "
+                   "page - all read from the employer's own site (robots.txt respected).")
     cols = ["name", "employer_type"] + (["contact_name", "contact_role"] if n_named else []) + [
-        "distance_miles", "phone", "website", "email", "address", "postcode", "source", "source_url"]
+        "distance_miles", "phone", "website", "email"] + (["vacancy", "vacancy_type", "vacancy_url"] if n_vac else []) + (
+        ["bank_url"] if n_bank else []) + (["careers_url"] if n_car else []) + ["address", "postcode", "source", "source_url"]
     if n_named:
         st.caption(f"**{n_named}** rows name a professional from an official register (registered manager, nurse "
                    "prescriber, headteacher, barrister) - **not job-seekers**. Approach them as employers / for "
@@ -569,6 +581,11 @@ def _employers() -> None:
                      "contact_role": "Their role (register)",
                      "distance_miles": st.column_config.NumberColumn("Miles away", format="%.1f"),
                      "phone": "Phone", "website": st.column_config.LinkColumn("Website"), "email": "Email",
+                     "vacancy": st.column_config.TextColumn("Open vacancy (own website)", width="medium"),
+                     "vacancy_url": st.column_config.LinkColumn("Vacancy", display_text="Open ↗"),
+                     "careers_url": st.column_config.LinkColumn("Careers page", display_text="Careers ↗"),
+                     "vacancy_type": "Vacancy type",
+                     "bank_url": st.column_config.LinkColumn("Join the bank / locum", display_text="Bank / locum ↗"),
                      "address": st.column_config.TextColumn("Address", width="large"), "postcode": "Postcode",
                      "source": "Source", "source_url": st.column_config.LinkColumn("Source record",
                                                                                    display_text="Record ↗")})
