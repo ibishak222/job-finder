@@ -172,7 +172,7 @@ def with_mode(title: str, mode) -> str:
     return title
 
 
-CAND_DEFAULTS = {"c_emp_sector": "All", "c_mode": "Any", "c_chip": None, "c_emp_f_locum": False, "c_emp_f_email": False, "c_emp_f_phone": False,
+CAND_DEFAULTS = {"c_emp_sector": "All", "c_emp_f_evid": False, "c_mode": "Any", "c_chip": None, "c_emp_f_locum": False, "c_emp_f_email": False, "c_emp_f_phone": False,
                  "c_emp_f_page": False, "c_emp_sort": "Best match", "c_emp_type": "All", "c_github": True, "c_bsky": True, "c_masto": True, "c_osm": True, "c_epmc": False, "c_emp": True, "c_team_urls": "",
                  "c_f_contract": "Any", "c_uk_unknown": True, "c_enrich_n": 60, "c_obf": True, "c_f_contact": False, "c_f_near": False, "c_sites": True, "c_ads": True, "c_ads_presets": True, "c_hireable": False,
                  "c_unread": True, "c_unknown": False, "c_retention": 30, "c_max_profiles": 200, "c_max_accounts": 600,
@@ -317,6 +317,7 @@ def _apply(t) -> None:
     st.session_state["cand_emp_note"] = getattr(res, "employers_note", "")
     st.session_state["cand_agencies"] = int(getattr(res, "agencies_removed", 0) or 0)
     st.session_state["c_emp_sector"] = "All"
+    st.session_state["c_emp_f_evid"] = False
     st.session_state["cand_research"] = getattr(res, "research_note", "")
     st.session_state.update({"c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False,
                              "c_f_contract": "Any", "c_f_sort": "Best match", "c_f_near": False,
@@ -432,7 +433,9 @@ def _people(df: pd.DataFrame) -> None:
         view = view[(view["email"] != "") | (view["phone"] != "")]
     if near:
         view = view[~view["location"].str.contains("no nearby town", regex=False)]
-    if sort == "Nearest":
+    if sort == "Locum evidence first":
+        view = view.sort_values("hires_locums", ascending=False, kind="stable")
+    elif sort == "Nearest":
         view = view.sort_values("distance_miles", na_position="last", kind="stable")
     elif sort == "Most experience":
         view = view.sort_values("experience_years", ascending=False, na_position="last", kind="stable")
@@ -530,7 +533,8 @@ EMPLOYER_COLUMNS = {"name": "Employer", "employer_type": "Type", "sector": "NHS 
                     "contact_role": "Their role (register)", "distance_miles": "Miles away", "address": "Address",
                     "postcode": "Postcode", "phone": "Phone", "email": "Email", "website": "Website",
                     "vacancy": "Open vacancy (own website)", "vacancy_type": "Vacancy type", "vacancy_url": "Vacancy link",
-                    "bank_url": "Join the bank / locum page",
+                    "bank_url": "Join the bank / locum page", "hires_locums": "Hires locums (3 advert · 2 bank page · 1 mentioned)",
+                    "locum_evidence": "Locum evidence (their own words / advert)", "locum_evidence_url": "Locum evidence link",
                     "careers_url": "Careers page", "source": "Source", "source_url": "Source record",
                     "ods_code": "NHS ODS code", "note": "Note"}
 EMPLOYER_NOTICE = ("Employers to contact - organisations that employ this kind of worker, NOT candidates. People named "
@@ -544,8 +548,10 @@ EMPLOYER_NOTICE = ("Employers to contact - organisations that employ this kind o
 def _emp_frame(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=EmployerLead.field_names())
     for c in ("name", "employer_type", "contact_name", "contact_role", "address", "postcode", "phone", "email",
-              "website", "source", "source_url", "ods_code", "note", "careers_url", "vacancy", "vacancy_url", "vacancy_type", "bank_url", "sector"):
+              "website", "source", "source_url", "ods_code", "note", "careers_url", "vacancy", "vacancy_url", "vacancy_type", "bank_url", "sector",
+              "locum_evidence", "locum_evidence_url"):
         df[c] = df[c].fillna("")
+    df["hires_locums"] = pd.to_numeric(df["hires_locums"], errors="coerce").fillna(0).astype(int)
     return df
 
 
@@ -553,7 +559,8 @@ def emp_exports(query: str) -> dict:
     def friendly(d):
         return d[[c for c in EMPLOYER_COLUMNS if c in d.columns]].rename(columns=EMPLOYER_COLUMNS)
     return {
-        "excel": lambda d: to_excel_bytes(friendly(d), "Employers", link_cols=("Website", "Source record", "Vacancy link", "Careers page", "Join the bank / locum page"),
+        "excel": lambda d: to_excel_bytes(friendly(d), "Employers", link_cols=("Website", "Source record", "Vacancy link", "Careers page", "Join the bank / locum page",
+                                                     "Locum evidence link"),
                                           wide_cols={"Employer": 36, "Address": 44, "Source record": 50},
                                           notice_sheet=("About", [EMPLOYER_NOTICE])),
         "csv": lambda d: to_csv_bytes(friendly(d)),
@@ -570,7 +577,7 @@ def _locum_friendly(df: pd.DataFrame) -> pd.Series:
     return hay.map(lambda t: bool(LOCUM_EMPLOYER.search(t)))
 
 
-EMP_SORTS = ["Best match", "Nearest", "Most contactable", "Name A–Z"]
+EMP_SORTS = ["Best match", "Locum evidence first", "Nearest", "Most contactable", "Name A–Z"]
 
 
 def _employers(df: pd.DataFrame) -> None:
@@ -587,8 +594,10 @@ def _employers(df: pd.DataFrame) -> None:
         m[0].metric("Employers", len(df))
         m[1].metric("Employers with phone", int((df["phone"] != "").sum()))
         m[2].metric("Employers with email", int((df["email"] != "").sum()))
-        m[3].metric("Locum employers", int(df["_locum"].sum()),
-                    help="Urgent care, out-of-hours providers, PCNs, GP federations, hubs, hospices, independent clinics (direct employers only; recruitment agencies are never listed)")
+        m[3].metric("Hire locums", int((df["hires_locums"] > 0).sum()),
+                    help="Employers whose own advert or website shows locum / bank / sessional hiring (the evidence and "
+                         f"its link are on each card). Kinds that book locums in bulk (urgent care, OOH, PCNs, hospices, "
+                         f"trusts' own banks): {int(df['_locum'].sum())}. Recruitment agencies and booking apps are never listed.")
         m[4].metric("Locum vacancies", int(locum_vac.sum()),
                     help="Locum / bank / temporary adverts read from the employers' own websites")
         m[5].metric("Join-the-bank pages", int((df["bank_url"] != "").sum()))
@@ -612,7 +621,10 @@ def _employers(df: pd.DataFrame) -> None:
     with st.expander("Filters & sort"):
         g1, g2 = st.columns(2)
         f_locum = g1.toggle("Locum / bank friendly only", key="c_emp_f_locum",
-                            help="Agencies, urgent care, out-of-hours, PCNs, GP federations, hubs, or a locum / bank page")
+                            help="Urgent care, out-of-hours, PCNs, GP federations, hubs, or a locum / bank page")
+        f_evid = g1.toggle("Shows locum / bank evidence", key="c_emp_f_evid",
+                           help="Only employers with a locum / bank advert open now, a staff-bank page, or a sentence on their own "
+                                "website about locum / bank / sessional staff")
         f_page = g2.toggle("Has a vacancy, bank or careers page", key="c_emp_f_page")
         f_email = g1.toggle("Has an email", key="c_emp_f_email")
         f_phone = g2.toggle("Has a phone number", key="c_emp_f_phone")
@@ -620,6 +632,8 @@ def _employers(df: pd.DataFrame) -> None:
     view = df if pick == "All" else df[df["employer_type"] == pick]
     if f_locum:
         view = view[view["_locum"] | (view["bank_url"] != "") | view["vacancy_type"].str.startswith("locum")]
+    if f_evid:
+        view = view[view["hires_locums"] > 0]
     if f_page:
         view = view[(view["vacancy"] != "") | (view["bank_url"] != "") | (view["careers_url"] != "")]
     if f_email:
@@ -658,7 +672,7 @@ def _employers(df: pd.DataFrame) -> None:
         if mode == "Table":
             _employer_table(view, df, n_named, n_vac, n_car, n_bank)
         else:
-            sig = f"{len(view)}|{pick}|{sort}|{f_locum}|{f_page}|{f_email}|{f_phone}"
+            sig = f"{len(view)}|{pick}|{sort}|{f_locum}|{f_evid}|{f_page}|{f_email}|{f_phone}"
             n = pager("emp_pager", sig, len(view), step=24)
             rows = view.head(n).to_dict(orient="records")
             st.markdown("".join(employer_card({k: v for k, v in r.items() if not k.startswith("_")},

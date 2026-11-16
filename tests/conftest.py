@@ -22,3 +22,10 @@ def _fresh_nhs_page_cache():
     nhs._PAGE_CACHE.clear()
     yield
     nhs._PAGE_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_locum_adverts(monkeypatch):
+    """Employer-level tests never read NHS Jobs / NHS Scotland / HSC NI for locum adverts unless they replace this."""
+    from recruit_scraper.candidates import locum
+    monkeypatch.setattr(locum, "locum_adverts", lambda *a, **kw: [])

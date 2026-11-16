@@ -225,7 +225,7 @@ def test_health_roles_map_to_employer_kinds():
     assert employer_kinds("mental health nurse")[0] == "mental_health"
     assert employer_kinds("nursing home nurse") == ["care_home", "home_care"]
     assert employer_kinds("support worker") == ["care_home", "home_care"]
-    assert employer_kinds("locum practice nurse")[-2:] == ["urgent_care", "independent"]
+    assert employer_kinds("locum practice nurse")[-3:] == ["urgent_care", "trust", "independent"]
     assert EmployerLeadsFinder._osm_kind({"healthcare": "hospice"}, ["hospital"]) == "hospital"
 
 

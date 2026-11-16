@@ -346,7 +346,7 @@ def _apply_jobs(t) -> None:
     st.session_state["jobs_agencies"] = int(getattr(res, "agencies_removed", 0) or 0)
     for k in ("j_f_text", "j_f_sources", "j_f_contract", "j_f_sector"):  # new search -> clear old table filters
         st.session_state[k] = JOB_DEFAULTS[k]
-    for k in ("j_f_salary", "j_f_remote", "j_f_email", "j_f_soon"):
+    for k in ("j_f_salary", "j_f_remote", "j_f_email", "j_f_soon", "j_f_rate"):
         st.session_state[k] = False
     st.session_state["j_f_sort"] = "Best match"
     if st.session_state.get("_jobs_mode") == "Permanent":
@@ -363,6 +363,8 @@ def _results_frame() -> pd.DataFrame:
     return cached[1]
 
 
+_RATE_RX = re.compile(r"(?:per|an|a|/)\s*(?:hour|hr|session|day|shift)\b|\bhourly\b|\bdaily rate\b|\bper (?:clinical )?session",
+                      re.I)
 SORTS = ["Best match", "Newest", "Closing soon", "Highest pay", "Company A–Z"]
 
 
@@ -422,6 +424,8 @@ def show_job_results() -> None:
         only_remote = g2.toggle("Only remote", key="j_f_remote")
         only_email = g1.toggle("Only with contact email", key="j_f_email", disabled=hide_contacts)
         soon = g2.toggle("Closing within 7 days", key="j_f_soon")
+        only_rate = g1.toggle("Hourly / session / day rate stated", key="j_f_rate",
+                              help="Locum pay as the ad writes it: per hour, per session, per day or per shift")
         contract = st.radio("Contract type", ["Any", "Permanent", "Locum / temp / contract"], horizontal=True,
                             key="j_f_contract",
                             help="Uses the ad's own contract type (e.g. NHS Jobs: Permanent / Fixed-Term / Bank / Locum) "
@@ -432,7 +436,7 @@ def show_job_results() -> None:
         def reset_filters():
             st.session_state.update({"j_f_text": "", "j_f_sources": [], "j_f_salary": False, "j_f_remote": False,
                                      "j_f_email": False, "j_f_contract": "Any", "j_f_soon": False, "j_f_sort": "Best match",
-                                     "j_f_sector": "All"})
+                                     "j_f_sector": "All", "j_f_rate": False})
         st.button("Reset filters", on_click=reset_filters, key="jobs_reset_filters")
 
     view = df
@@ -452,6 +456,9 @@ def show_job_results() -> None:
         view = view[view["contract"] == ("permanent" if contract == "Permanent" else "temporary")]
     if only_salary:
         view = view[view["salary"] != ""]
+    if only_rate:
+        pay = view["salary"].fillna("") + " " + view["salary_raw"].fillna("").astype(str)
+        view = view[pay.str.contains(_RATE_RX, na=False)]
     if only_remote:
         view = view[view["remote"] == "Yes"]
     if only_email and not hide_contacts:
@@ -479,7 +486,7 @@ def show_job_results() -> None:
         if mode == "Table":
             _job_table(view, hide_contacts)
         else:
-            sig = f"{len(view)}|{q}|{sort}|{contract}|{only_salary}|{only_remote}|{only_email}|{soon}|{srcs}|{sector}"
+            sig = f"{len(view)}|{q}|{sort}|{contract}|{only_salary}|{only_remote}|{only_email}|{soon}|{srcs}|{sector}|{only_rate}"
             n = pager("j_pager", sig, len(view))
             rows = view.head(n).to_dict(orient="records")
             st.markdown("".join(job_card(r, hide_contacts) for r in rows), unsafe_allow_html=True)

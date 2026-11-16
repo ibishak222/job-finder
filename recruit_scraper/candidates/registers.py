@@ -41,6 +41,7 @@ from datetime import date, timedelta
 from typing import Callable, Iterable, Iterator, Optional
 
 import requests
+import urllib3
 
 from ..agencies import is_agency_employer
 from ..http import HttpClient
@@ -949,7 +950,8 @@ class RegistersFinder:
                     rows.sort(key=lambda r: (-contact_score(r), r.postcode) if uk else rank.get(outcode(r.postcode), 999))
                     self.stats[attempt.key] = len(rows)
                     return rows[: self.max_rows]
-                except (RegisterUnavailable, requests.RequestException, zipfile.BadZipFile, OSError, csv.Error) as e:
+                except (RegisterUnavailable, requests.RequestException, urllib3.exceptions.HTTPError, zipfile.BadZipFile,
+                        OSError, csv.Error) as e:      # urllib3's own errors can surface raw from a streamed read
                     log.info("register %s failed: %s", attempt.key, e)
                     self.notes.append(f"{label} register unavailable ({e}); the other sources still ran")
             return []

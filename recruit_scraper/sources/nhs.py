@@ -55,7 +55,18 @@ LOCUM_KEYWORDS = {
     "community nurse": ["district nurse", "community staff nurse", "practice nurse"],
     "healthcare assistant": ["health care assistant", "healthcare support worker", "phlebotomist"],
     "nurse": ["staff nurse", "registered nurse", "practice nurse", "community nurse"],
+    "mental health nurse": ["registered mental health nurse", "community psychiatric nurse", "psychiatric nurse", "rmn"],
+    "learning disability nurse": ["learning disabilities nurse", "rnld"],
+    "gp": ["general practitioner", "sessional gp", "salaried gp"],
+    "general practitioner": ["gp", "sessional gp"],
+    "pharmacist": ["clinical pharmacist", "pharmacy technician"],
+    "physiotherapist": ["physio", "musculoskeletal physiotherapist"],
+    "occupational therapist": ["occupational therapy"],
+    "support worker": ["healthcare support worker", "care worker", "care assistant"],
+    "care assistant": ["healthcare support worker", "support worker"],
 }
+LOCUM_KEYWORDS["healthcare assistant"] += ["clinical support worker", "nursing assistant", "hca"]
+LOCUM_KEYWORDS["care home nurse"] = LOCUM_KEYWORDS["nursing home nurse"] = ["registered nurse", "staff nurse"]
 _PERIOD = re.compile(r"£\s?[\d,]+(?:\.\d{2})?(?:\s*(?:-|to)\s*£?\s?[\d,]+(?:\.\d{2})?)?\s*(?:per|an|a|/)\s*"
                      r"(hour|hr|session|day|shift|week|month|annum|year)\b", re.I)
 _HOURS = re.compile(r"\b(\d+(?:\.\d+)?\s*(?:-|to)?\s*\d*(?:\.\d+)?\s*(?:clinical\s+)?(?:sessions?|hours?|hrs|days?)\s*"
@@ -142,6 +153,7 @@ class NHSJobsSource(Source):
     retries = 3              # the feed sometimes answers 404 for a minute under load
     server_side_location = True  # the feed already searches within `distance` miles of the place
     stats: dict = None           # filled by fetch(): pages read / cached, ads seen, ads that fit the title
+    only_contract = False        # employer evidence mode: only the Locum / Bank (contract-filtered) searches, few pages
 
     def _queries(self) -> list[tuple[dict, int]]:
         from ..candidates.matching import RoleMatcher
@@ -151,14 +163,16 @@ class NHSJobsSource(Source):
         rm = RoleMatcher(kw)
         core = rm.core or kw
         out: list[tuple[dict, int]] = []
-        if rm.contract == "temporary":
+        if rm.contract == "temporary" or self.only_contract:
             # locum / bank work: ask the feed for exactly those contracts ('practice nurse' + Locum, + Bank), for the
             # title and the close primary / community nursing titles locum work is also advertised under
             nationwide = (self.location or "").strip().lower() in _NATIONWIDE or not self.location
             pages = self.contract_pages_uk if nationwide else self.contract_pages
             kws = [core] + LOCUM_KEYWORDS.get(core, [])
             out += [({"keyword": k, "contractType": t}, pages) for k in kws for t in ("Locum", "Bank")]
-            out.append(({"keyword": f"sessional {core}"}, 1))
+            if self.only_contract:
+                return out
+            out += [({"keyword": f"{w} {core}"}, 2) for w in ("sessional", "bank", "locum")]
         out.append(({"keyword": core}, self.max_pages))
         if rm.synonyms:
             out += [({"keyword": s}, self.syn_pages) for s in rm.search_terms(self.n_terms)[1:]]
@@ -287,7 +301,7 @@ class NHSJobsSource(Source):
             self.info.append(f"NHS Jobs: {self.stats['queries']} searches, {self.stats['pages']} pages read"
                              + (f" (+{self.stats['cached_pages']} from the 30-minute cache)" if self.stats["cached_pages"] else "")
                              + f", {self.stats['ads_seen']} ads checked, {self.stats['title_matches']} fit the title")
-        jobs = hits[:want] + rest[: max(0, min(want - len(hits), 50))]
+        jobs = hits[:want] + ([] if self.only_contract else rest[: max(0, min(want - len(hits), 50))])
         if base:
             jobs = self._near(jobs)
         yield from jobs

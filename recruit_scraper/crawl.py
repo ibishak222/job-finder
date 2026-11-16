@@ -26,9 +26,13 @@ _CAREERS = re.compile(r"career|vacanc|\bjobs?\b|join[ -](our|the|us)|work(ing)?[
                       r"opportunit|employment|we.re hiring|come and work", re.I)
 _BANK = re.compile(r"\b(nurse|nurses|staff|clinician|locum|care|carer|hca|worker|flexible|join[ _-](our|the)|our|a)[ _-]bank\b|"
                    r"\bbank[ _-](staff|worker|nurse|shift|work|team|register|opportunit)|locum|flexi(ble)?[ _-]?(pool|work|staff)|"
-                   r"sessional|ad[ _-]?hoc|temporary[ _-](staff|work|roles|staffing)|register[ _-](with[ _-]us|your[ _-]interest)|"
+                   r"sessional|ad[ _-]?hoc|temporary[ _-](staff|work|roles|staffing)|register[ _-]your[ _-]interest|"
                    r"join[ _-](our|the)[ _-](pool|team[ _-]of[ _-]locums)|agency[ _-](staff|nurses|work)|work[ _-](flexibly|shifts)|"
                    r"shift[ _-]work", re.I)
+# links about patients registering with a practice are not staff-bank pages ("Register with us" on a surgery site)
+_PATIENT = re.compile(r"patient|registration|registering|register[ _-]with|new[ _-]?pat", re.I)
+_STAFFY = re.compile(r"locum|sessional|staff[ _-]bank|bank[ _-]staff|nurse[ _-]bank|\bhca\b|join[ _-](our|the)[ _-]bank|work|job|career|"
+                     r"vacanc|recruit", re.I)
 _BAD_HREF = re.compile(r"\.(pdf|docx?|xlsx?|jpe?g|png|gif|svg|zip|mp4)(\?|$)|^(mailto|tel|javascript):|/wp-json/|"
                        r"/(privacy|cookie|terms|login|sign-?in|basket|cart)(/|$)", re.I)
 _NO_VACANCIES = re.compile(r"\b(no|currently no|there are no|sorry,? no)( current| open| available)? "
@@ -57,6 +61,8 @@ def classify_links(html: str, base_url: str, limit: int = 3) -> dict[str, list[s
             if kind == "contact" and not _same_site(href, base_url):
                 continue
             in_text, in_path = bool(rx.search(text)), bool(rx.search(path))
+            if kind == "bank" and _PATIENT.search(f"{text} {path}") and not _STAFFY.search(f"{text} {path}"):
+                continue
             if not (in_text or in_path) or len(text) > 60 and not in_path:
                 continue
             # short link text beats a path match; navigation links (nav / header / footer) beat body links

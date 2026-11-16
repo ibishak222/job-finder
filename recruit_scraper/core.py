@@ -73,6 +73,12 @@ _HOSPITAL_ONLY = re.compile(r"\b(pre[- ]?op|theatres?|ward|inpatient|icu|itu|cri
                             r"dermatology|urology|outpatients?|hospital|safeguarding|research)\b", re.I)
 
 
+_NOT_A_GP = re.compile(r"\bgp\b[\s\-:,/]*(practice |surgery )?(receptionist|reception|nurse|practice manager|manager|administrator|"
+                       r"admin|secretary|clerk|pharmacist|physio|paramedic|healthcare assistant|hca|phlebotomist|care ?navigator|"
+                       r"coordinator|co-ordinator|technician|trainer|support)|\b(receptionist|nurse|manager|administrator|clerk|"
+                       r"pharmacist|assistant)\b[\s\-:,/]*(at|in|for|to)?[\s\-:,/]*\bgp\b", re.I)
+
+
 def keyword_hit(job: Job, keyword: str, temporary: bool = False) -> bool:
     """A job title keyword ('care worker', 'locum nurse') must be in the job's TITLE as the whole phrase or a known
     synonym ('carer', 'support worker'); single words from it anywhere in the ad ('care' + 'worker') don't count.
@@ -103,6 +109,8 @@ def keyword_hit(job: Job, keyword: str, temporary: bool = False) -> bool:
                        None)
     if hit is None or _not_the_job(title, hit):
         return False
+    if rm.core in ("gp", "general practitioner") and _NOT_A_GP.search(title):
+        return False          # 'GP Receptionist', 'GP Practice Nurse': works at a GP practice, is not a GP
     if rm.contract == "temporary" and not CONTRACT_TEMP.search(f"{hay}\n{job.employment_type or ''}".lower()):
         return False      # 'locum nurse': the ad has to say locum / bank / agency / temporary somewhere
     return True

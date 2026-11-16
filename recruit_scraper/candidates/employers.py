@@ -33,13 +33,14 @@ from .geo import API as POSTCODES_API, Place, haversine_miles
 log = logging.getLogger(__name__)
 
 ODS = "https://directory.spineservices.nhs.uk/ORD/2-0-0/organisations"
-ODS_ROLES = {"gp": "RO76", "care_home": "RO269", "home_care": "RO270", "dental": "RO110", "pharmacy": "RO182"}
+ODS_ROLES = {"trust": "RO197", "gp": "RO76", "care_home": "RO269", "home_care": "RO270", "dental": "RO110", "pharmacy": "RO182"}
 TYPE_LABELS = {"gp": "GP practice", "care_home": "Care home / nursing home", "home_care": "Home care agency",
                "dental": "Dental practice", "pharmacy": "Pharmacy", "hospital": "Hospital", "clinic": "Clinic",
                "urgent_care": "Urgent care / walk-in / out-of-hours", "independent": "Independent clinic / private practice",
                "community": "Community nursing service", "trades": "Electrician / plumber / builder / trade firm",
                "accountancy": "Accountancy / tax practice", "law": "Law firm", "food": "Restaurant / pub / cafe / hotel",
-               "mental_health": "Mental health / learning disability service"}
+               "mental_health": "Mental health / learning disability service",
+               "trust": "NHS trust (runs its own staff bank)"}
 OSM_FILTERS = {
     "gp": ['["amenity"="doctors"]', '["healthcare"="doctor"]'],
     "care_home": ['["social_facility"~"^(nursing_home|assisted_living)$"]', '["amenity"="nursing_home"]',
@@ -60,7 +61,7 @@ OSM_FILTERS = {
 # job title -> kinds of employer (first match wins; checked in order)
 ROLE_EMPLOYERS: list[tuple[re.Pattern, list[str]]] = [
     (re.compile(r"\bdental|dentist|hygienist\b", re.I), ["dental"]),
-    (re.compile(r"\bpharmac", re.I), ["pharmacy"]),
+    (re.compile(r"\bpharmac", re.I), ["pharmacy", "gp"]),
     (re.compile(r"mental health|\brmn\b|\brnld\b|psychiatric|learning disabilit|\bcamhs\b|\bcpn\b", re.I),
      ["mental_health", "hospital", "care_home", "community"]),
     (re.compile(r"\b(nursing|residential|care|dementia) home\b.*\b(nurse|rgn)\b|\b(nurse|rgn)\b.*\b(nursing|residential|care|"
@@ -76,6 +77,11 @@ ROLE_EMPLOYERS: list[tuple[re.Pattern, list[str]]] = [
                 r"senior care|reablement|shared lives", re.I), ["care_home", "home_care"]),
     (re.compile(r"\b(hca|health ?care assistant|nursing assistant|nursing associate|clinical support)", re.I),
      ["gp", "care_home", "hospital"]),
+    (re.compile(r"\b(gps?|general practitioner|salaried gp|locum gp|doctor|physician|medical officer|clinical fellow|"
+                r"sessional (gp|doctor))\b", re.I), ["gp", "urgent_care", "hospital"]),
+    (re.compile(r"\b(physiotherapist|physio|occupational therapist|paramedic|podiatrist|chiropodist|dietitian|dietician|"
+                r"radiographer|sonographer|speech (and language )?therapist|orthoptist|audiologist|health visitor|"
+                r"clinical pharmacist)\b", re.I), ["gp", "community", "hospital", "clinic"]),
     (re.compile(r"\bnurs(e|es|ing)\b|\brgn\b|\brmn\b|midwi", re.I), ["gp", "care_home", "hospital", "clinic"]),
     # official registers only (see registers.py): kitchens, schools, barristers' chambers
     (re.compile(r"\b(chef|cook|kitchen|sous|commis|catering|pastry)\b", re.I), ["food"]),
@@ -91,7 +97,9 @@ ROLE_EMPLOYERS: list[tuple[re.Pattern, list[str]]] = [
 
 
 _NURSING = re.compile(r"\bnurs|\brgn\b|\brmn\b|\banp\b|\bgpn\b|\bhca\b|health ?care assistant|practitioner|"
-                      r"\bcare (worker|assistant)|carer|support worker|care co-?ordinator", re.I)
+                      r"\bcare (worker|assistant)|carer|support worker|care co-?ordinator|\bgps?\b|general practitioner|"
+                      r"\bdoctor|physician|pharmacist|physio|occupational therapist|paramedic|podiatrist|dietitian|"
+                      r"dietician|radiographer|sonographer|speech (and language )?therapist|health visitor|midwi", re.I)
 
 # names that mark the DIRECT employers a LOCUM / bank worker is booked by: urgent care and out-of-hours providers, PCNs
 # and GP federations / alliances / extended-access hubs, hospices, and NHS trusts' own staff banks. Recruitment, staffing
@@ -105,6 +113,16 @@ def locum_priority(lead: "EmployerLead") -> int:
     """0 for the direct employers that book locum / bank staff in bulk (urgent care, OOH, PCNs / federations, hubs, hospices,
     trusts' own banks); 1 for the rest (GP practices, independent clinics, care homes - all direct employers too)."""
     return 0 if LOCUM_EMPLOYER.search(f"{lead.employer_type} {lead.name}") else 1
+
+
+def locum_rank(lead: "EmployerLead") -> int:
+    """0 an advert for locum / bank staff is open now · 1 a staff bank / locum page, or the kind of direct employer that
+    books locums in bulk (urgent care, OOH, PCNs / federations, hospices, trusts' own banks) · 2 the rest."""
+    if lead.hires_locums >= 3:
+        return 0
+    if lead.hires_locums == 2 or locum_priority(lead) == 0:
+        return 1
+    return 2
 
 
 _PRIVATE_TITLE = re.compile(r"\b(private|independent|self-?pay)\b", re.I)
@@ -123,7 +141,7 @@ def employer_kinds(title: str) -> list[str]:
             kinds = list(kinds)
             if is_locum_search(title):
                 # locum / bank nursing: also out-of-hours / urgent care providers (direct employers; agencies are never listed)
-                kinds += [k for k in ("urgent_care",) if k not in kinds]
+                kinds += [k for k in ("urgent_care", "trust") if k not in kinds]
             if _CLINICAL_KINDS & set(kinds) and "dental" not in kinds:
                 # independent / private GP services and clinics employ these roles too ('private practice nurse' first)
                 kinds = ["independent"] + kinds if _PRIVATE_TITLE.search(title or "") else kinds + ["independent"]
@@ -136,7 +154,7 @@ def _tier(lead: "EmployerLead", kinds: list[str]) -> int:
     t = (lead.employer_type or "").lower()
     order = {"gp": r"gp practice|doctors", "urgent_care": r"urgent care|walk-in|out-of-hours",
              "independent": r"independent|private|aesthetic|occupational|travel / vaccination|online / telephone",
-             "mental_health": r"mental health|learning disab", "community": r"community (nursing|health)",
+             "trust": r"nhs trust|health board", "mental_health": r"mental health|learning disab", "community": r"community (nursing|health)",
              "care_home": r"care home|nursing home", "home_care": r"home care|care at home|housing support|domiciliary",
              "hospital": r"hospital|hospice", "clinic": r"clinic|community"}
     for i, k in enumerate(kinds):
@@ -174,6 +192,10 @@ class EmployerLead:
     vacancy_type: str = ""    # 'locum / bank / temporary' or 'permanent / other', from the advert
     bank_url: str = ""        # a 'join our bank' / locum / flexible-staff page on the employer's website
     sector: str = ""          # 'NHS' | 'Independent' | '' (health sector split; blank for care homes, schools, firms)
+    hires_locums: int = 0     # 0 no evidence · 1 its own site mentions locum / bank / sessional staff · 2 it has a bank / locum
+                              # page · 3 it has a locum / bank / sessional advert open now
+    locum_evidence: str = ""  # the words / advert that show it, as the employer published them
+    locum_evidence_url: str = ""   # the page or advert that says so (source link)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -296,7 +318,9 @@ class EmployerLeadsFinder:
     def __init__(self, http: Optional[HttpClient] = None, osm_http: Optional[HttpClient] = None,
                  max_districts: int = 15, max_details: int = 40, max_leads: int = 250, max_geocode: int = 600,
                  osm_radius_miles: float = 6, registers=True, max_named: int = 150, practice_sites: int = 60,
-                 practice_seconds: float = 60):
+                 practice_seconds: float = 60, locum_adverts: bool = True, advert_seconds: float = 30.0,
+                 uk_trusts: int = 45):
+        self.locum_adverts, self.advert_seconds, self.uk_trusts = locum_adverts, advert_seconds, uk_trusts
         self.http = http or HttpClient(min_interval=0.3, timeout=30, retries=2, backoff=2)
         self.osm_http = osm_http or overpass_http()  # short timeouts + overall budget: don't stall the search
         self.max_districts, self.max_details, self.max_leads = max_districts, max_details, max_leads
@@ -311,12 +335,12 @@ class EmployerLeadsFinder:
         self.stats = {"ods_records": 0, "osm_places": 0, "with_phone": 0, "with_website": 0, "with_email": 0}
 
     # --- NHS ODS -------------------------------------------------------------------------------------------
-    def _cached_json(self, url: str, params: Optional[dict] = None):
+    def _cached_json(self, url: str, params: Optional[dict] = None, http: Optional[HttpClient] = None):
         key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted((params or {}).items()))
         hit = self.cache.get(key)
         if hit is not None:
             return hit
-        data = self.http.get_json(url, params=params)
+        data = (http or self.http).get_json(url, params=params)
         self.cache.set(key, data)
         return data
 
@@ -416,8 +440,8 @@ class EmployerLeadsFinder:
                 if c.get("type") == "tel" and not l.phone:
                     l.phone = c.get("value", "")
                 elif c.get("type") in ("http", "https", "url") and not l.website:
-                    v = c.get("value", "")
-                    l.website = v if v.startswith("http") else f"https://{v}"
+                    v = (c.get("value") or "").strip().lower()      # ODS publishes these in capitals
+                    l.website = v if v.startswith("http") else f"https://{v}" if v else ""
                 elif c.get("type") == "email" and not l.email:
                     l.email = (find_emails(c.get("value", "")) or [""])[0]
         self.stats["ods_records"] = len(leads)
@@ -626,6 +650,8 @@ class EmployerLeadsFinder:
                 l.vacancy_url = v.get("url") or v.get("page") or l.careers_url
                 n_v += 1
                 found = True
+            if self._locum_evidence(l, got, src):
+                found = True
             if found and "employer website" not in l.source:
                 l.source += " + employer website"
                 l.source_url = f"{l.source_url} {src}".strip()
@@ -634,6 +660,136 @@ class EmployerLeadsFinder:
                           site_bank_pages=n_b)
         if len(done) < len(todo):
             self.notes.append(f"employer websites: {len(todo) - len(done)} not read (time limit)")
+
+    @staticmethod
+    def _locum_evidence(l: EmployerLead, got: dict, src: str) -> bool:
+        """What the employer's OWN site shows about locum / bank / sessional hiring: an open locum advert (3), a bank /
+        locum page (2), or a sentence on its site that says it uses such staff (1). The strongest evidence wins."""
+        vac = next((v for v in got.get("vacancies") or [] if v.get("type") == "locum / bank / temporary"), None)
+        if vac and l.hires_locums < 3:
+            l.hires_locums, l.locum_evidence = 3, f"Open now: {vac['title']}"
+            l.locum_evidence_url = vac.get("url") or vac.get("page") or src
+            return True
+        if got.get("bank_url") and l.hires_locums < 2:
+            l.hires_locums, l.locum_evidence = 2, "Has a staff bank / locum page on its own website"
+            l.locum_evidence_url = got["bank_url"]
+            return True
+        if got.get("locum_cue") and l.hires_locums < 1:
+            l.hires_locums, l.locum_evidence = 1, got["locum_cue"]
+            l.locum_evidence_url = got.get("locum_cue_url") or src
+            return True
+        return False
+
+    # --- locum evidence: direct employers' own adverts, trusts' own banks ---------------------------------------
+    def _start_adverts(self, title: str, place: Place, radius_miles: float):
+        """For a locum / bank search: read the employers' own locum / bank adverts (NHS Jobs, NHS Scotland, HSC NI) in the
+        background while the registers load. Returns a holder the result is collected from."""
+        if not is_locum_search(title) or not self.locum_adverts:
+            return None
+        box: dict = {"jobs": [], "done": threading.Event()}
+        nations = None if place.nationwide else {place.country or "England"}
+        loc = "UK" if place.nationwide else place.postcode
+
+        def run():
+            from .locum import locum_adverts
+            try:
+                box["jobs"] = locum_adverts(title, loc, radius_miles, seconds=min(self.advert_seconds, max(10.0, self._left() * 0.35)),
+                                            nations=nations)
+            except BaseException as e:  # noqa: BLE001
+                log.info("locum adverts: %s", e)
+            finally:
+                box["done"].set()
+        threading.Thread(target=run, daemon=True).start()
+        return box
+
+    def _attach_adverts(self, leads: list[EmployerLead], box, title: str) -> None:
+        if not box:
+            return
+        box["done"].wait(max(1.0, min(self._left() * 0.3, 25.0)))
+        jobs = list(box["jobs"])
+        if not box["done"].is_set():
+            self.notes.append("locum adverts: stopped at the time limit (partial)")
+        from .locum import attach_adverts
+        flagged, added = attach_adverts(leads, jobs, EmployerLead)
+        for l in leads:
+            if l.hires_locums >= 3 and not l.sector:
+                l.sector = assign_sector(l)
+        self.enrich_trusts(leads)
+        self.stats.update(locum_adverts=len(jobs), locum_adverts_matched=flagged, locum_adverts_new_employers=added)
+
+    def trust_leads_uk(self, progress: Callable[[str], None]) -> list[EmployerLead]:
+        """NHS trusts (they run their own staff banks) from the NHS ODS API, with the phone and website the NHS publishes
+        for each; the contact details are looked up for a spread of trusts across the country."""
+        progress("NHS ODS: NHS trusts (their own staff banks)…")
+        data = self._cached_json(ODS, {"Roles": ODS_ROLES["trust"], "Status": "Active", "Limit": 1000}) or {}
+        recs = [o for o in data.get("Organisations") or [] if o.get("PrimaryRoleId") == "RO197"]
+        recs.sort(key=lambda o: (re.sub(r"\d.*", "", o.get("PostCode", "")), o.get("Name", "")))
+        step = max(1, len(recs) // max(1, self.uk_trusts))
+        leads = [EmployerLead(name=_title(o.get("Name", "")), employer_type=TYPE_LABELS["trust"],
+                              postcode=o.get("PostCode", ""), source="NHS ODS", ods_code=o["OrgId"],
+                              source_url=f"{ODS}/{o['OrgId']}", sector="NHS") for o in recs[::step][: self.uk_trusts]]
+        self.stats["trusts_uk"] = len(leads)
+        return leads
+
+    _ADVERT_SRC = ("NHS Jobs", "NHS Scotland Jobs", "HSC NI jobs", "job advert")
+
+    def enrich_trusts(self, leads: list[EmployerLead]) -> None:
+        """Phone + website the NHS publishes (ODS record) for trusts, and for employers found only from their own locum /
+        bank advert, matched to the ODS record by exact name (a single trust match is enough for trusts). Time-boxed."""
+        todo = [l for l in leads if not (l.phone and l.website) and
+                (l.employer_type == TYPE_LABELS["trust"] or
+                 (l.hires_locums >= 3 and not l.ods_code and l.source.split(" + ")[0] in self._ADVERT_SRC))]
+        todo.sort(key=lambda l: l.employer_type == TYPE_LABELS["trust"] and l.hires_locums < 3)   # their own advert first
+        todo = todo[:90]
+        if not todo:
+            return
+        end = time.monotonic() + min(25.0, max(12.0, self._left() * 0.3))
+        ods_http = HttpClient(min_interval=0.15, timeout=15, retries=1, backoff=1)   # the NHS directory API is open and quick
+
+        def one(l: EmployerLead):
+            if time.monotonic() > end:
+                return None
+            try:
+                oid = l.ods_code
+                if not oid:
+                    trust = l.employer_type == TYPE_LABELS["trust"]
+                    q = {"Name": l.name, "Status": "Active", "Limit": 8}
+                    if trust:
+                        q["Roles"] = ODS_ROLES["trust"]
+                    cands = (self._cached_json(ODS, q, http=ods_http) or {}).get("Organisations") or []
+                    nk = _name_key(l.name)
+                    best = next((o for o in cands if nk and _name_key(o.get("Name", "")) == nk), None) or \
+                        (cands[0] if trust and len(cands) == 1 else None)
+                    if not best:
+                        return None
+                    oid = best["OrgId"]
+                    l_pc = best.get("PostCode", "")
+                else:
+                    l_pc = ""
+                org = (self._cached_json(f"{ODS}/{oid}", http=ods_http) or {}).get("Organisation") or {}
+                return oid, l_pc, org
+            except (requests.RequestException, ValueError, KeyError) as e:
+                log.info("ODS lookup failed %s: %s", l.name, e)
+                return None
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(one, todo))
+        for l, got in zip(todo, results):
+            if not got:
+                continue
+            oid, pc, org = got
+            l.ods_code = l.ods_code or oid
+            l.postcode = l.postcode or pc
+            l.source_url = l.source_url or f"{ODS}/{oid}"
+            for c in ((org.get("Contacts") or {}).get("Contact") or []):
+                if c.get("type") == "tel" and not l.phone:
+                    l.phone = c.get("value", "")
+                elif c.get("type") in ("http", "https", "url") and not l.website:
+                    v = (c.get("value") or "").strip().lower()      # ODS publishes these in capitals
+                    l.website = v if v.startswith("http") else f"https://{v}" if v else ""
+            if "NHS ODS" not in l.source:
+                l.source += " + NHS ODS"
+                l.source_url = f"{l.source_url} {ODS}/{oid}".strip()
 
     # --- both ------------------------------------------------------------------------------------------------
     def find(self, title: str, place: Place, radius_miles: float, entries: Iterable[str] = (),
@@ -644,6 +800,9 @@ class EmployerLeadsFinder:
         self._deadline = time.monotonic() + self.budget_seconds
         ods: list[EmployerLead] = []
         osm: list[EmployerLead] = []
+        adverts_box = self._start_adverts(title, place, radius_miles)
+        if place.nationwide and "trust" in kinds:
+            ods = self._bounded("NHS trusts", min(25.0, self._left() * 0.2), lambda: self.trust_leads_uk(progress), [])
         if not place.nationwide:   # the ODS API and the map search work around a postcode; whole-UK uses registers
             try:
                 ods = self._bounded("NHS ODS lookup", min(45.0, self._left() * 0.4),
@@ -661,6 +820,7 @@ class EmployerLeadsFinder:
                                            lambda: self.register_leads(kinds, title, place, radius_miles, progress),
                                            ([], []))
             leads = merge_leads(leads, reg_emp)
+        self._attach_adverts(leads, adverts_box, title)
         # direct employers only: recruitment / staffing / locum agencies are other recruiters
         leads, n_ag = drop_agencies(leads)
         named, n_ag2 = drop_agencies(named)
@@ -675,7 +835,7 @@ class EmployerLeadsFinder:
         if locum:
             kinds = ["urgent_care"] + [k for k in kinds if k != "urgent_care"]
         tiered = len(kinds) <= 3 or locum   # a broad title ('nurse') keeps every kind of employer mixed by distance
-        leads.sort(key=lambda l: (locum_priority(l) if locum else 0, _tier(l, kinds) if tiered else 0,
+        leads.sort(key=lambda l: (locum_rank(l) if locum else 0, _tier(l, kinds) if tiered else 0,
                                   l.distance_miles is None, int((l.distance_miles or 0) // 3),
                                   -contactability(l), l.distance_miles or 0, l.name))
         named.sort(key=lambda l: (l.distance_miles is None, l.distance_miles or 0, l.name))
@@ -683,7 +843,8 @@ class EmployerLeadsFinder:
         if self.practice_sites:
             self.practice_sites_contacts(leads, progress, title)
             # employers advertising this role right now first, a locum / bank advert before a permanent one (stable)
-            leads.sort(key=lambda l: (not l.vacancy, l.vacancy_type != "locum / bank / temporary" if locum else 0))
+            leads.sort(key=lambda l: (-(l.hires_locums if locum else 0), not l.vacancy,
+                                      l.vacancy_type != "locum / bank / temporary" if locum else 0))
             leads, n3 = suppress_leads(leads, entries)   # a newly found email may be on the do-not-contact list
             n += n3
         leads = leads + named[: self.max_named]

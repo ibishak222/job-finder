@@ -56,6 +56,16 @@ def vacancy_type(job: Job) -> str:
     return "locum / bank / temporary" if CONTRACT_TEMP.search(hay) else "permanent / other"
 
 
+# third-party banks, booking apps and agencies: a link to one of them is never an employer's own bank page
+THIRD_PARTY_BANK = re.compile(r"nhsprofessionals|nhsp\.|lantum|locumsnest|locums-nest|patchwork|indeedflex|locumkit|shiftkey|"
+                              r"healthtrust|bankpartners|medacs|pulsejobs|pulsehealthcare|reed\.co|hays\.co|"
+                              r"totaljobs|indeed\.|jobs\.nhs\.uk/.*agency", re.I)
+
+
+def is_third_party_bank(url: str) -> bool:
+    return bool(THIRD_PARTY_BANK.search(urlparse(url).netloc + urlparse(url).path))
+
+
 def _same_host(a: str, b: str) -> bool:
     ha, hb = _host(a), _host(b)
     return ha == hb or ha.endswith("." + hb) or hb.endswith("." + ha)
@@ -77,6 +87,30 @@ def _noindex(resp: requests.Response, soup: BeautifulSoup) -> bool:
         if "noindex" in (m.get("content") or "").lower():
             return True
     return False
+
+
+_LOCUM_CUE = re.compile(
+    r"\b(locums?|sessional (?:gps?|clinicians?|nurses?|staff|work|posts?|sessions?)|bank (?:staff|nurses?|workers?|shifts?|team|"
+    r"clinicians?|healthcare assistants?|hcas?)|(?:join|joining|register (?:for|with|to join)) (?:our|the) (?:staff )?bank|"
+    r"ad[- ]?hoc (?:shifts?|sessions?|cover)|zero[- ]hours?|flexible (?:shifts?|workers?|staff))\b", re.I)
+_LOCUM_NEG = re.compile(r"\b(?:no|not|never|without|don'?t|do not|doesn'?t)\b[^.]{0,25}$|\blocum (?:insurance|indemnity)\b", re.I)
+
+
+def locum_cue(text: str) -> str:
+    """A short sentence from the employer's own page that says it uses locum / bank / sessional staff ('' when none).
+    'We do not use locums' and locum insurance do not count."""
+    t = re.sub(r"\s+", " ", text or "")
+    for m in _LOCUM_CUE.finditer(t):
+        before = t[max(0, m.start() - 30):m.start()]
+        if _LOCUM_NEG.search(before) or _LOCUM_NEG.search(t[m.start():m.end() + 25]):
+            continue
+        lo = max(0, m.start() - 70)
+        hi = min(len(t), m.end() + 90)
+        snip = t[lo:hi].strip()
+        if lo:
+            snip = snip.split(" ", 1)[-1]
+        return ("…" if lo else "") + snip + ("…" if hi < len(t) else "")
+    return ""
 
 
 def parse_page(html: str, base_url: str) -> dict:
@@ -127,7 +161,7 @@ def parse_page(html: str, base_url: str) -> dict:
         if e not in emails:
             emails.append(e)
     out = {"emails": emails, "phones": clean_phones(phones, text), "linkedin": linkedin, "twitter": twitter,
-           "managers": practice_managers(text)}
+           "managers": practice_managers(text), "locum_cue": locum_cue(text)}
     out.update({f"{k}_links": v for k, v in classify_links(html, base_url).items()})
     return out
 
@@ -350,7 +384,7 @@ class SiteContactFinder:
         'Get in touch'), then the usual paths; robots.txt and noindex are respected and every page is cached."""
         url = normalise_url(site_url)
         res = {"emails": [], "phones": [], "managers": [], "source_url": None, "note": "", "careers_url": "",
-               "vacancies": [], "pages": 0, "bank_url": ""}
+               "vacancies": [], "pages": 0, "bank_url": "", "locum_cue": "", "locum_cue_url": ""}
         if not url or is_no_fetch(url):
             return res
         host = _host(url)
@@ -365,6 +399,8 @@ class SiteContactFinder:
         careers_links = list(home.get("careers_links") or [])
         pages = [(url, home)]
         self._collect(res, home, url, host)
+        if home.get("locum_cue"):
+            res["locum_cue"], res["locum_cue_url"] = home["locum_cue"], home.get("url") or url
         fallback = [urljoin(base, p) for p in ("/contact-us", "/contact")] if not contact_links else []
         for page in contact_links[:2] + fallback + [urljoin(base, "/practice-staff")]:
             if len(pages) >= 4 or (res["emails"] and res["managers"] and page != url):
@@ -378,7 +414,8 @@ class SiteContactFinder:
                 pages.append((page, got))
                 self._collect(res, got, page, host)
         res["pages"] = len(pages)
-        bank_links = list(home.get("bank_links") or [])
+        bank_links = [b for b in (home.get("bank_links") or []) if not is_third_party_bank(b)]
+        careers_links = [c for c in careers_links if not is_third_party_bank(c)]
         temporary = _TEMP_SEARCH.search(keyword or "") is not None
         # locum / bank searches look at the 'join our bank' pages first, others at the careers pages first
         links = (bank_links + careers_links) if temporary else (careers_links + bank_links)
@@ -399,9 +436,11 @@ class SiteContactFinder:
                 continue
             res["pages"] += 1
             self._collect(res, got, link, host)
+            if got.get("locum_cue") and (not res["locum_cue"] or link in bank_links):
+                res["locum_cue"], res["locum_cue_url"] = got["locum_cue"], got.get("url") or link
             items = [Job(**{k: v for k, v in j.items() if k in Job.field_names()}) for j in got.get("vacancies") or []]
             for b in got.get("bank_links") or []:
-                if not res["bank_url"]:
+                if not res["bank_url"] and not is_third_party_bank(b):
                     res["bank_url"] = b
             found = matching_vacancies(items, keyword)
             if not found and got.get("feeds"):

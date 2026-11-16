@@ -220,7 +220,9 @@ def test_candidates_page_healthcare_extras(monkeypatch, tmp_path):
                                   profile_url="https://europepmc.org/article/MED/1", match_score=1.5)],
             research_note="Clinical researchers (Europe PMC): ... PECR ...",
             employers=[EmployerLead(name="Vallance Medical", employer_type="GP practice", phone="0161 000",
-                                    source="NHS ODS", source_url="https://directory.spineservices.nhs.uk/x", sector="NHS"),
+                                    source="NHS ODS", source_url="https://directory.spineservices.nhs.uk/x", sector="NHS",
+                                    hires_locums=3, locum_evidence="Advertising now (NHS Jobs): Locum Practice Nurse",
+                                    locum_evidence_url="https://www.jobs.nhs.uk/x"),
                        EmployerLead(name="Oak House", employer_type="Care home / nursing home", source="OpenStreetMap"),
                        EmployerLead(name="Harley Clinic", employer_type="Independent clinic", phone="020 7000", source="CQC",
                                     sector="Independent")],
@@ -239,6 +241,12 @@ def test_candidates_page_healthcare_extras(monkeypatch, tmp_path):
     assert any("Employers to contact (3)" in h.value for h in at.subheader)
     assert m["Independent"] == "1"
     assert any("2 recruitment / staffing / locum agencies left out" in c.value for c in at.caption)
+    assert m["Hire locums"] == "1"
+    html = " ".join(x.value for x in at.markdown)
+    assert "Hires locums" in html and "Locum Practice Nurse" in html and "https://www.jobs.nhs.uk/x" in html
+    at.toggle(key="c_emp_f_evid").set_value(True).run()
+    assert not at.exception and any("Showing **1** of 3" in c.value for c in at.caption)
+    at.toggle(key="c_emp_f_evid").set_value(False).run()
     at.session_state["c_emp_sector"] = "Independent"
     at.run()
     assert not at.exception and any("Showing **1** of 1" in c.value for c in at.caption)
@@ -282,3 +290,20 @@ def test_nhs_independent_filter_badges_and_agency_note(monkeypatch):
     assert {m.label: m.value for m in at.metric}["Jobs shown"] == "1"
     html = " ".join(m.value for m in at.markdown)
     assert "jf-badge info" in html and "NHS" in html
+
+
+def test_jobs_rate_stated_filter(monkeypatch):
+    def rate_search(sources, **kw):
+        return SearchResult(jobs=[
+            Job(title="Locum Practice Nurse", company="Oaks", url="https://x.test/1", source="nhsjobs", salary_raw="£32 per hour"),
+            Job(title="Locum GP", company="Elm", url="https://x.test/2", source="nhsjobs", salary_raw="£300 per session"),
+            Job(title="Practice Nurse", company="Ash", url="https://x.test/3", source="nhsjobs", salary_raw="£30,000 a year")])
+    monkeypatch.setenv("APP_PASSWORD", "")
+    monkeypatch.setattr(core, "search", rate_search)
+    monkeypatch.setattr(ui_common, "RUN_INLINE", True)
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    _search(at)
+    at.toggle(key="j_f_rate").set_value(True).run()
+    assert not at.exception
+    assert {m.label: m.value for m in at.metric}["Jobs shown"] == "2"

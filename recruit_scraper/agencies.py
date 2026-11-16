@@ -6,7 +6,8 @@ company entries in 'Employers to contact' (CQC-registered nurse / staffing agenc
 
 What counts as an agency:
 * a well-known agency or job-board name (Reed, Hays, Pertemps, Randstad, Medacs, Pulse, ID Medical, Thornbury,
-  Your World Healthcare, Sanctuary Personnel, NHS Professionals, Indeed Flex, Teaching Personnel …);
+  Your World Healthcare, Sanctuary Personnel, NHS Professionals, Indeed Flex, Teaching Personnel …) and locum
+  booking apps / platforms (Lantum, Patchwork Health, Locum's Nest, LocumKit …);
 * a name that says so ('… Recruitment', '… Staffing', 'Locum Agency', 'Nursing Agency', '… Personnel',
   'Healthcare Professionals', 'Resourcing', 'Executive Search');
 * an ad whose text says it is placed for someone else ('our client', 'on behalf of our client', 'employment agency').
@@ -34,6 +35,7 @@ _KNOWN = [
     "mayday healthcare", "plan healthcare", "penguin recruitment", "locum'?s nest", "locumsnest", "bluebird staffing",
     "cavendish professionals", "healthcare locums", "bright ?path medical", "wtl healthcare", "xpr healthcare", "nurse ?plus",
     "pulse healthcare", "ashbourne healthcare", "cera care staffing", "nursing personnel", "medics ?direct",
+    "gtd healthcare", "lantum", "patchwork( health)?", "locumkit", "locum ?(bookings|cover|app)", "shift ?key", "bank ?staff ?app", "tempus ?health",
     "bank partners", "rwj", "drs ?direct", "staff ?nurse ?direct", "trustedcare", "totalmed", "ashton ?healthcare",
     # education
     "teaching personnel", "tradewind( recruitment)?", "supply desk", "eteach", "teacheractive", "teach active",

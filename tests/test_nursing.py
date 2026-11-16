@@ -93,7 +93,7 @@ def test_social_search_nationwide_keeps_any_uk_town_without_distance():
 def test_locum_kinds_and_tiers():
     assert employer_kinds("practice nurse") == ["gp", "independent"]
     assert employer_kinds("private practice nurse") == ["independent", "gp"]
-    assert employer_kinds("locum practice nurse") == ["gp", "urgent_care", "independent"]
+    assert employer_kinds("locum practice nurse") == ["gp", "urgent_care", "trust", "independent"]
     assert "nurse_agency" not in employer_kinds("locum practice nurse")      # agencies are never employers to contact
     assert employer_kinds("ANP") == ["gp", "urgent_care", "independent"]
     assert employer_kinds("district nurse")[0] == "community"
