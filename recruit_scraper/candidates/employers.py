@@ -332,6 +332,7 @@ class EmployerLeadsFinder:
         self.cache = DiskCache("employers", 7 * 86400)
         self.osm_cache = DiskCache("osm", 86400)
         self.notes: list[str] = []
+        self.site_jobs: list[tuple["EmployerLead", dict]] = []   # (employer, vacancy) read off employers' own sites
         self.stats = {"ods_records": 0, "osm_places": 0, "with_phone": 0, "with_website": 0, "with_email": 0}
 
     # --- NHS ODS -------------------------------------------------------------------------------------------
@@ -462,7 +463,7 @@ class EmployerLeadsFinder:
         if els is None:
             progress("OpenStreetMap: employers near the postcode…")
             try:
-                els = overpass_elements(self.osm_http, q, budget=min(20.0, max(5.0, self._left() * 0.2)))
+                els = overpass_elements(self.osm_http, q, budget=min(30.0, max(5.0, self._left() * 0.3)))
                 self.osm_cache.set(q, els)
             except OverpassUnavailable as e:
                 self.notes.append(f"OpenStreetMap's Overpass servers didn't answer ({e}); showing NHS ODS / official "
@@ -639,6 +640,7 @@ class EmployerLeadsFinder:
                 l.bank_url = got["bank_url"]
                 n_b += 1
             if got.get("vacancies"):
+                self.site_jobs.extend((l, v) for v in got["vacancies"])     # every matching advert (Jobs page source)
                 # a locum / bank advert is shown first: that's the one a locum search is after
                 vs = sorted(got["vacancies"], key=lambda v: v.get("type") != "locum / bank / temporary")
                 v = vs[0]

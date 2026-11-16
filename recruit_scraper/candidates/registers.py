@@ -73,6 +73,9 @@ RQIA_XLSX = "https://www.rqia.org.uk/download/32/services-registered-with-rqia/4
 RQIA_PAGE = "https://www.rqia.org.uk/what-we-do/register/"
 HIW_CSV = "https://www.hiw.org.uk/service-directory.csv"
 HIW_PAGE = "https://www.hiw.org.uk/service-index"
+# Legal Aid Agency directory of providers (OGL v3.0): every solicitors' firm / advice organisation office holding a legal
+# aid contract in England & Wales, with its office phone and the areas of law it covers. Updated monthly.
+LAA_PAGE = "https://www.gov.uk/government/publications/directory-of-legal-aid-providers"
 
 LICENCES = {
     "CQC": "CQC data (Open Government Licence v3.0)",
@@ -85,6 +88,7 @@ LICENCES = {
     "PHS": "Public Health Scotland open data (Open Government Licence v3.0)",
     "HSC BSO": "HSC Business Services Organisation practice list (published for professional use)",
     "RQIA": "RQIA register of services (Northern Ireland)",
+    "LAA": "Legal Aid Agency directory of legal aid providers (Open Government Licence v3.0)",
     "HIW": "Healthcare Inspectorate Wales service directory (public register; check HIW's terms before re-use)",
 }
 
@@ -608,7 +612,8 @@ class BarristersRegister(Register):
         return not m or m.group(1)[:5].lower() in row.tags.lower()
 
 
-def read_xlsx(http: HttpClient, url: str, budget: _Budget, max_bytes: int = 20 * 1024 * 1024) -> list[tuple]:
+def read_xlsx(http: HttpClient, url: str, budget: _Budget, max_bytes: int = 20 * 1024 * 1024,
+              sheet: str = "") -> list[tuple]:
     """A small official spreadsheet (a few hundred KB): downloaded with a size cap, every row as a tuple."""
     import openpyxl
     import warnings
@@ -630,7 +635,7 @@ def read_xlsx(http: HttpClient, url: str, budget: _Budget, max_bytes: int = 20 *
             wb = openpyxl.load_workbook(buf, read_only=True, data_only=True)
         except Exception as e:  # noqa: BLE001 - not a spreadsheet (an error page)
             raise RegisterUnavailable("not a spreadsheet") from e
-        ws = wb.active
+        ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.active
         ws.reset_dimensions()         # these files carry a wrong 'A1' dimension
         rows = [tuple("" if v is None else str(v).strip() for v in row) for row in ws.iter_rows(values_only=True)]
         wb.close()
@@ -774,9 +779,52 @@ class RQIARegister(Register):
                 or ("home_care" in kinds and t.startswith("Domiciliary Care")))
 
 
+_LAA_AREAS = [(r"\bcrim|duty solicitor|police station|magistrates|prison", "Crime"), (r"\bfamily|divorce|child(ren)? law|care proceedings|"
+              r"private law|public law children", "Family"), (r"immigration|asylum", "Immigration Asylum"),
+              (r"\bhousing|landlord|tenan", "Housing"), (r"mental health|tribunal", "Mental Health"),
+              (r"welfare|benefits", "Welfare Benefits"), (r"\bdebt", "Debt"), (r"community care", "Community Care"),
+              (r"clinical negligence|medical negligence", "Clinical Negligence"), (r"public law|judicial review", "Public Law"),
+              (r"education law|\bsend\b", "Education"), (r"discrimination|employment", "Discrimination"),
+              (r"mediat", "Mediation"), (r"modern slavery", "Modern Slavery"), (r"actions? against (the )?police", "Actions againt the Police")]
+
+
+class LegalAidProviders(Register):
+    """Law firms and advice organisations with a legal aid contract (Legal Aid Agency directory, England & Wales): name,
+    office address, office phone and the areas of law - direct employers of solicitors, paralegals and legal staff."""
+    key, label, kinds = "laa", "LAA", {"law"}
+    nations = {"England", "Wales"}
+
+    def download(self, http, keep, budget):
+        url = latest_link(http, LAA_PAGE, r'href="(https://assets\.publishing\.service\.gov\.uk/[^"]+\.xlsx)"')
+        rows = read_xlsx(http, url, budget, sheet="Summary")
+        header = None
+        for row in rows:
+            cells = [c.strip() for c in row]
+            if header is None:
+                if "Firm Name" in cells and "Postcode" in cells:
+                    header = {h: i for i, h in enumerate(cells) if h}
+                    areas = [h for h in cells[header.get("Telephone Number", 0) + 1:] if h]
+                continue
+            g = lambda h: cells[header[h]] if h in header and header[h] < len(cells) else ""
+            pc = pc_norm(g("Postcode"))
+            if not g("Firm Name") or not keep(outcode(pc)):
+                continue
+            held = [a for a in areas if g(a) and g(a).lower() not in ("no", "n", "0", "-")]
+            tc = lambda v: _title(v) if v.isupper() else v
+            yield RegRow(name=tc(g("Firm Name")), employer_type="Law firm / legal advice (legal aid contract)",
+                         postcode=pc, address=", ".join(filter(None, [tc(g("Address Line 1")), tc(g("Address Line 2")),
+                                                                      tc(g("City"))])),
+                         phone=_phone(g("Telephone Number")), source="LAA", source_url=LAA_PAGE,
+                         tags="|".join(held))
+
+    def wanted(self, row, kinds, title):
+        need = [area for rx, area in _LAA_AREAS if re.search(rx, title or "", re.I)]
+        return not need or any(a in row.tags.split("|") for a in need)
+
+
 REGISTERS: list[Register] = [CQCDirectory(), CareInspectorate(), ODSPractices(), PHSScotlandPractices(),
                              NIPractices(), RQIARegister(), HIWRegister(), ODSNursePrescribers(), GIASSchools(), CharityRegister(),
-                             BarristersRegister()]
+                             BarristersRegister(), LegalAidProviders()]
 FALLBACKS = {"cqc": ODSCareHomes()}
 
 FSA_TYPES = {1: "Restaurant / cafe / canteen", 7843: "Pub / bar / nightclub", 7842: "Hotel / B&B",
@@ -943,7 +991,10 @@ class RegistersFinder:
                                           f"{'-'.join(sorted(kinds))}:{title.lower().strip()}") if uk
                            else self.subset(attempt, wanted, budget))
                     rows = [r for r in got if attempt.wanted(r, kinds, title)]
-                    n_ag = sum(1 for r in got if _agency_row(r))
+                    # count only the agencies this search would have listed (not every agency in the area's register),
+                    # and drop them here so they are not counted twice later
+                    n_ag = len({(r.extra.partition("§")[0] or r.name).lower() for r in rows if _agency_row(r)})  # organisations, not people
+                    rows = [r for r in rows if not _agency_row(r)]
                     if n_ag:
                         with self._lock:
                             self.stats["agencies"] = self.stats.get("agencies", 0) + n_ag   # recruiters left out

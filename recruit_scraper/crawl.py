@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 _CONTACT = re.compile(r"contact|get[ -]in[ -]touch|find[ -]us|enquir|reach[ -]us", re.I)
 _CAREERS = re.compile(r"career|vacanc|\bjobs?\b|join[ -](our|the|us)|work(ing)?[ -](for|with|at)[ -]us|recruit|"
-                      r"opportunit|employment|we.re hiring|come and work", re.I)
+                      r"opportunit|employment (opportunit|with us)|we.re hiring|come and work", re.I)
 _BANK = re.compile(r"\b(nurse|nurses|staff|clinician|locum|care|carer|hca|worker|flexible|join[ _-](our|the)|our|a)[ _-]bank\b|"
                    r"\bbank[ _-](staff|worker|nurse|shift|work|team|register|opportunit)|locum|flexi(ble)?[ _-]?(pool|work|staff)|"
                    r"sessional|ad[ _-]?hoc|temporary[ _-](staff|work|roles|staffing)|register[ _-]your[ _-]interest|"
@@ -153,12 +153,24 @@ def vacancy_items(html: str, url: str, company: str = "") -> list[Job]:
     return jobs
 
 
+# link / heading text that is a page about the firm's SERVICES, not a job ('Divorce Solicitors', 'Find a lawyer',
+# 'Our Manchester employment solicitors can help', 'Emergency Plumbers Bristol', 'No win no fee')
+_SERVICE_TITLE = re.compile(r"\b(find an?|how to|best|choos\w*|tips|why|what|when|our|we|you|your|services?|can help|help with|no win|faqs?|contact|about|news|blog|"
+                            r"testimonials?|reviews?|areas?|near me|prices?|pricing|fees?|quotes?|call|book|menu|"
+                            r"advice|guide|law firm|why choose|meet the team|team|home)\b|"
+                            r"\b(solicitors|lawyers|accountants|electricians|plumbers|builders|engineers|chefs|"
+                            r"restaurants?|teachers|carers|cleaners)\b|[?!]", re.I)
+
+
 def matching_vacancies(items: list[Job], keyword: Optional[str], limit: int = 5) -> list[Job]:
-    """The vacancies whose title fits the search ('Practice Nurse', or a locum / bank ad for a locum search)."""
+    """The vacancies whose title fits the search ('Practice Nurse', or a locum / bank ad for a locum search). Titles read
+    off links / headings (no JobPosting data) must also not read like a services page ('Divorce Solicitors')."""
     from .core import keyword_hit
     if not keyword:
         return items[:limit]
-    return [j for j in items if keyword_hit(j, keyword)][:limit]
+    def plain(j: Job) -> bool:     # a heuristic item: the link text only
+        return (j.description or "") == (j.title or "")
+    return [j for j in items if keyword_hit(j, keyword) and not (plain(j) and _SERVICE_TITLE.search(j.title or ""))][:limit]
 
 
 def vacancies_on_page(html: str, url: str, keyword: Optional[str], company: str = "") -> list[Job]:

@@ -32,6 +32,9 @@ SOURCE_INFO = {
     "teachingvacancies": ("Teaching Vacancies (GOV.UK, England)", "Official DfE open data: teachers, teaching assistants, "
                           "SENCOs, headteachers and school support staff at state schools, with pay and closing date. "
                           "Used for school / education searches.", True),
+    "employersites": ("Local employers' own careers pages", "Law firms, accountants, trades, care providers, restaurants / "
+                      "hotels and schools near the place (from official registers and OpenStreetMap): the vacancies they "
+                      "publish on their own websites. Direct employers only, never agencies. Takes up to ~1.5 minutes.", True),
     "nhsjobs": ("NHS Jobs (UK)", "NHS and NHS-funded jobs in England & Wales (nurses, HCAs, admin, doctors…). "
                 "Shows Permanent / Fixed-term / Bank / Locum. A locum / bank title asks for those contracts.", True),
     "nhsscotland": ("NHS Scotland Jobs", "NHS boards in Scotland (apply.jobs.scot.nhs.uk): staff bank, fixed-term and "

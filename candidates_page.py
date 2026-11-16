@@ -540,7 +540,8 @@ EMPLOYER_COLUMNS = {"name": "Employer", "employer_type": "Type", "sector": "NHS 
 EMPLOYER_NOTICE = ("Employers to contact - organisations that employ this kind of worker, NOT candidates. People named "
                    "here come from an official register (registered manager, nurse prescriber, headteacher, "
                    "barrister) and are NOT job-seekers. Sources: CQC, Care Inspectorate, NHS Organisation Data "
-                   "Service, Food Standards Agency, DfE GIAS, Charity Commission (all Open Government Licence v3.0), "
+                   "Service, Food Standards Agency, DfE GIAS, Charity Commission, Legal Aid Agency directory of providers "
+                   "(all Open Government Licence v3.0), "
                    "Bar Standards Board Barristers' Register, OpenStreetMap (© OpenStreetMap contributors, ODbL). "
                    "Respect each person's objection to contact; UK GDPR/PECR apply.")
 

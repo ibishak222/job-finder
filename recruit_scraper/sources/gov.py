@@ -35,6 +35,30 @@ EDUCATION = re.compile(r"teach|tutor|lectur|school|college|academy|senco|sendco|
                        r"\bsen\b|special (needs|educational)|midday|lunchtime|caretaker|school business|"
                        r"educational psychologist|safeguarding lead|librarian|exams? officer|invigilator|"
                        r"reprographics|science technician|bursar", re.I)
+# school phase words in a search ('primary teacher') are matched against the school / ad, not the job title: primary
+# schools advertise 'Class Teacher (UKS2)', 'Year 3 Teacher', 'EYFS Teacher'
+PHASES = {
+    "primary": re.compile(r"\bprimary\b|\binfants?\b|\bjunior\b|\bfirst school\b|\b[lu]?ks ?[12]\b|\beyfs\b|\breception\b|"
+                          r"\byear [1-6]\b|\bearly years\b|\bnursery\b", re.I),
+    "secondary": re.compile(r"\bsecondary\b|\bhigh school\b|\bgrammar school\b|\bks ?[345]\b|\bgcse\b|\ba[- ]levels?\b|"
+                            r"\bsixth form\b|\b(11|12)\s*[-–]\s*(16|18)\b|\bcollege\b|\bupper school\b", re.I),
+    "nursery": re.compile(r"\bnursery\b|\bearly years\b|\beyfs\b|\bpre-?school\b", re.I),
+}
+_PHASE_WORD = re.compile(r"\b(primary|secondary|nursery|early years)\b\s*", re.I)
+
+
+def split_phase(kw: str) -> tuple[str, Optional[re.Pattern]]:
+    """'primary teacher' -> ('teacher', primary-phase pattern); 'teacher' -> ('teacher', None)."""
+    m = _PHASE_WORD.search(kw or "")
+    if not m:
+        return kw, None
+    core = (kw[:m.start()] + kw[m.end():]).strip()
+    if not core:
+        return kw, None
+    phase = m.group(1).lower().replace("early years", "nursery")
+    return core, PHASES[phase]
+
+
 _CONTRACT = re.compile(r"Contract Type:\s*([A-Za-z][A-Za-z \-]{2,24}?)(?=\s{2,}|\s*(?:Salary|Hours|Location|Required)\b|$)")
 
 
@@ -53,6 +77,7 @@ class TeachingVacanciesSource(Source):
     budget_seconds = 45
     distance = 15
     server_side_location = True   # this source does its own distance filter (below)
+    server_side_keyword = True    # and its own role match (school phase aware, below)
     cache_hours = 3
 
     def __init__(self, *a, **kw):
@@ -127,10 +152,17 @@ class TeachingVacanciesSource(Source):
         outcodes = self._near_outcodes()
         loc = (self.location or "").strip().lower()
         n = 0
+        core, phase = split_phase(kw)
         for jp in self._pages():
             job = jobposting_to_job(jp, API, source=self.name)
             if not keyword_hit(job, kw):
-                continue
+                if phase is None or not keyword_hit(job, core):
+                    continue
+                org = jp.get("hiringOrganization") or {}
+                where = f"{job.title} {job.company} {org.get('name', '') if isinstance(org, dict) else ''} " \
+                        f"{html_to_text(jp.get('description'))[:1500]}"
+                if not phase.search(where):
+                    continue
             job.location = _location(jp) or job.location
             if outcodes is not None:
                 pc = ((jp.get("jobLocation") or {}).get("address") or {}).get("postalCode") if isinstance(

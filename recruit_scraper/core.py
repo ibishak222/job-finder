@@ -208,7 +208,10 @@ def search(sources: list[str], *, keywords: list[str] = (), locations: list[str]
                 if not job.url or not job.title:
                     continue
                 # sources that already searched by distance around the place (NHS Jobs) skip the text place check
-                if not matches(job, keywords, [] if getattr(src, "server_side_location", False) and locations
+                # sources that matched the role themselves (Teaching Vacancies: 'primary teacher' = a Class Teacher at
+                # a primary school) skip the title check too
+                kws = [] if getattr(src, "server_side_keyword", False) else keywords
+                if not matches(job, kws, [] if getattr(src, "server_side_location", False) and locations
                                else locations, remote_uk, temporary=contract == "temporary"):
                     continue
                 if is_agency_job(job):          # direct employers only: never another recruiter's ad

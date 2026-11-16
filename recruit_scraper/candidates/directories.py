@@ -60,9 +60,13 @@ OSM_TAGS: dict[str, list[tuple[str, str]]] = {
     "physiotherapist": [("healthcare", "physiotherapist")], "optician": [("shop", "optician")],
     "dentist": [("amenity", "dentist")], "vet": [("amenity", "veterinary")],
 }
-OVERPASS = ("https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter")
+# public Overpass instances listed on the OSM wiki; each search asks them at the same time (one query each) and takes
+# the first answer - single servers are often overloaded for minutes at a time
+OVERPASS = ("https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter",
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter")
+HEDGE_SECONDS = 6.0          # ask the mirrors too when the main server is this slow (or failed)
 OVERPASS_BUDGET = 60.0       # seconds for all Overpass servers together, so a busy server can't stall a search
-OVERPASS_COOLDOWN = 600.0    # after every server failed, skip Overpass for 10 minutes instead of waiting again
+OVERPASS_COOLDOWN = 300.0    # after every server failed, skip Overpass for 5 minutes instead of waiting again
 _overpass_down_until = 0.0
 
 
@@ -72,20 +76,40 @@ def overpass_http() -> HttpClient:
 
 
 def overpass_elements(http: HttpClient, q: str, budget: float = OVERPASS_BUDGET) -> list[dict]:
-    """Ask each Overpass server in turn within one overall time budget; raise OverpassUnavailable if none answer."""
+    """Ask the Overpass servers in parallel within one overall time budget (first good answer wins); raise
+    OverpassUnavailable if none answer."""
     global _overpass_down_until
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     now = time.monotonic()
     if now < _overpass_down_until:
         raise OverpassUnavailable("skipped - the servers didn't answer a few minutes ago")
-    start, last = now, None
-    for url in OVERPASS:
-        if time.monotonic() - start > budget:
-            break
-        try:
-            return http.get_json(url, params={"data": q}).get("elements") or []
-        except (requests.RequestException, ValueError) as e:
-            last = e
-            log.info("overpass %s failed: %s", url, e)
+    end, last = now + budget, None
+
+    def ask(url):
+        return http.get_json(url, params={"data": q}).get("elements") or []
+    pool = ThreadPoolExecutor(max_workers=len(OVERPASS))
+    pending = {pool.submit(ask, OVERPASS[0]): OVERPASS[0]}
+    try:
+        # hedged: the main server first; the mirrors are asked too only if it hasn't answered within a few seconds
+        done, _ = wait(pending, timeout=min(HEDGE_SECONDS, budget))
+        for f in done:
+            try:
+                return f.result()
+            except (requests.RequestException, ValueError) as e:
+                last = e
+                log.info("overpass %s failed: %s", pending.pop(f), e)
+        pending.update({pool.submit(ask, u): u for u in OVERPASS[1:]})
+        while pending and time.monotonic() < end:
+            done, _ = wait(pending, timeout=max(0.5, end - time.monotonic()), return_when=FIRST_COMPLETED)
+            for f in done:
+                url = pending.pop(f)
+                try:
+                    return f.result()
+                except (requests.RequestException, ValueError) as e:
+                    last = e
+                    log.info("overpass %s failed: %s", url, e)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     _overpass_down_until = time.monotonic() + OVERPASS_COOLDOWN
     raise OverpassUnavailable(type(last).__name__ if last else f"no answer within {budget:.0f}s")
 

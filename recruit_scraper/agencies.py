@@ -46,6 +46,29 @@ _KNOWN = [
     "taylor root", "laurence simons", "major players", "douglas scott", "ellis fairbank", "lex ?recruit",
     "accountancy ?action", "joslin rowe", "hudson legal", "chef ?in ?the ?house", "chefs ?connect", "hospitality ?staff",
     "tempest ?recruit", "jobs4chefs", "chef jobs", "caterer\\.com",
+    # law
+    "sammons( legal)?", "chadwick nott", "shilton sharpe quarry", "bcl legal", "g2 legal", "clayton legal", "simply law jobs",
+    "totally legal", "legal ?week jobs", "jm ?legal", "macdonald ?& ?company", "law ?gazette jobs", "c ?& ?m legal",
+    "tlt resourcing", "dmj legal", "edwards gibson", "frazer jones",
+    # accountancy / finance
+    "sewell wallis", "marks sattin", "goodman masson", "walker hamill", "pro-?finance", "brewer morris", "cast uk",
+    "rise technical", "finance ?& ?accountancy professionals", "accountancy age jobs", "icaew jobs", "acca careers",
+    "hays accountancy", "page group", "spencer ?ogden", "kenda ?recruitment",
+    # trades / construction / facilities
+    "randstad cpe", "gi ?group", "fusion people", "prime appointments", "trades ?workforce( solutions)?", "tradesmen on demand",
+    "construction personnel", "build ?recruitment", "hamilton mayday", "first choice staff", "pertemps construction",
+    "rullion", "redline group", "sanderson recruitment", "cpe recruitment", "workforce ?solutions", "beachwood recruit",
+    "hunters? (people|workforce)", "on ?site recruitment", "tradestaff", "trade ?force",
+    # hospitality / catering
+    "berkeley scott", "hospitality recruitment solutions", "rocket recruitment", "syft", "stint ?(\\.co|app|staffing)", "temper (works|app)",
+    "brigad", "yourcatering ?recruit", "hcareers", "springboard jobs", "indeed flex", "the ?staffing ?group",
+    "hospitality ?jobs ?uk", "chefs ?on ?call", "rsvp ?staffing", "event ?staff ?uk", "ess ?staffing",
+    # care
+    "florence (app|staffing|healthcare staffing)", "hcl workforce", "sugarman", "ambition ?24 ?hours?", "care ?staffing ?solutions", "nursing ?point",
+    "medacs care", "team ?24", "vivid ?care ?staffing", "care ?24 ?seven",
+    # education
+    "remedy education", "long term futures", "edex education", "senploy", "career teachers",
+    "tes jobs", "spencer clarke group", "cover teachers", "school ?staffing ?solutions",
 ]
 _KNOWN_RX = re.compile(r"(?<![\w])(" + "|".join(_KNOWN) + r")(?![\w])", re.I)
 
