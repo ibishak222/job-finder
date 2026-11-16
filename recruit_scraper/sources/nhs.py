@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
 import xml.etree.ElementTree as ET
 from typing import Iterator, Optional
 
@@ -27,6 +29,14 @@ from .base import Source
 
 log = logging.getLogger(__name__)
 FEED = "https://www.jobs.nhs.uk/api/v1/search_xml"
+FEED_HOST = "www.jobs.nhs.uk"
+# the feed's pages are kept for a while: the same title is searched again and again (perm / locum, town / UK), and the
+# fewer requests NHS Jobs gets the less often it answers 429 / 404
+_PAGE_CACHE: dict[str, tuple[float, bytes]] = {}
+_PAGE_LOCK = threading.Lock()
+PAGE_CACHE_SECONDS = 30 * 60
+PAGE_CACHE_MAX = 700
+_BAND = re.compile(r"\bband\s?(\d[abcd]?|[2-9])\b", re.I)
 POSTCODES = "https://api.postcodes.io"
 _PC = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})\b", re.I)
 _NATIONWIDE = {"uk", "u.k.", "united kingdom", "gb", "great britain", "nationwide", "all uk", "whole uk", "uk-wide",
@@ -119,15 +129,19 @@ def geocode_place(http, location: str) -> Optional[tuple[float, float, str]]:
 class NHSJobsSource(Source):
     name = "nhsjobs"
     description = "NHS Jobs public XML search feed (UK healthcare: nurses, HCAs, admin, doctors…). No key."
-    max_pages = 10           # for the main title
-    syn_pages = 2            # for each synonym
-    contract_pages = 3       # for each of Locum / Bank and each locum keyword (local search)
-    contract_pages_uk = 8    # … on a whole-UK search
+    max_pages = 60           # for the main title (the feed is relevance-ordered: paging stops when the hits run out)
+    syn_pages = 12           # for each synonym
+    contract_pages = 8       # for each of Locum / Bank and each locum keyword (local search)
+    contract_pages_uk = 14   # … on a whole-UK search
+    miss_limit = 3           # stop a search after this many pages in a row with no ad that fits the title
+    pace = 1.5               # seconds between requests to NHS Jobs, one at a time (faster gets 429 / 404)
+    n_terms = 8              # the title plus up to 7 synonyms are searched (practice nurse, GPN, treatment room nurse …)
     budget_seconds = 100     # stop asking the feed after this long (the source is one of several in a search)
     distance = 15
     retry_pause = 2.0
     retries = 3              # the feed sometimes answers 404 for a minute under load
     server_side_location = True  # the feed already searches within `distance` miles of the place
+    stats: dict = None           # filled by fetch(): pages read / cached, ads seen, ads that fit the title
 
     def _queries(self) -> list[tuple[dict, int]]:
         from ..candidates.matching import RoleMatcher
@@ -147,7 +161,7 @@ class NHSJobsSource(Source):
             out.append(({"keyword": f"sessional {core}"}, 1))
         out.append(({"keyword": core}, self.max_pages))
         if rm.synonyms:
-            out += [({"keyword": s}, self.syn_pages) for s in rm.search_terms(3)[1:]]
+            out += [({"keyword": s}, self.syn_pages) for s in rm.search_terms(self.n_terms)[1:]]
         return out
 
     def _feed_location(self, loc: str) -> str:
@@ -225,14 +239,15 @@ class NHSJobsSource(Source):
         seen: set[str] = set()
         hits: list[Job] = []
         rest: list[Job] = []
-        import time
         end = time.monotonic() + self.budget_seconds
         failed = 0     # searches in a row the feed did not answer
+        self.stats = {"pages": 0, "cached_pages": 0, "queries": 0, "ads_seen": 0, "title_matches": 0}
         for q, pages in self._queries():
             if time.monotonic() > end:
                 self.info.append("time limit reached - some NHS Jobs searches skipped")
                 break
             params = {**q, **base}
+            self.stats["queries"] += 1
             got = misses = 0
             if failed >= 2:
                 self.info.append("NHS Jobs stopped answering - the rest of its searches were skipped")
@@ -245,6 +260,7 @@ class NHSJobsSource(Source):
                     break
                 failed = 0
                 items = root.findall("vacancyDetails")
+                self.stats["ads_seen"] += len(items)
                 page_hits = 0
                 for v in items:
                     job = self._job(v)
@@ -256,38 +272,62 @@ class NHSJobsSource(Source):
                         hits.append(job)
                         page_hits += 1
                         got += 1
+                        self.stats["title_matches"] += 1
                     else:
                         rest.append(job)
                 # the feed is fuzzy and relevance-ordered: after two pages in a row with nothing that fits the
                 # search, later pages will not have any either, so the time goes to the next search instead
                 misses = 0 if page_hits else misses + 1
                 total = int(root.findtext("totalPages") or 0)
-                if not items or page >= total or got >= want or misses >= 2 or time.monotonic() > end:
+                if not items or page >= total or got >= want or misses >= self.miss_limit or time.monotonic() > end:
                     break
             if len(hits) >= want:
                 break
-        jobs = hits[:want] + rest[: max(0, want - len(hits))]
+        if self.stats["pages"] + self.stats["cached_pages"]:
+            self.info.append(f"NHS Jobs: {self.stats['queries']} searches, {self.stats['pages']} pages read"
+                             + (f" (+{self.stats['cached_pages']} from the 30-minute cache)" if self.stats["cached_pages"] else "")
+                             + f", {self.stats['ads_seen']} ads checked, {self.stats['title_matches']} fit the title")
+        jobs = hits[:want] + rest[: max(0, min(want - len(hits), 50))]
         if base:
             jobs = self._near(jobs)
         yield from jobs
 
     def _page(self, params: dict, end: float = float("inf")):
-        """One feed page. The feed now and then answers 404 / 5xx for a valid search under load, so it is asked
-        again a few times after a growing pause; a last failure is reported and only that search is given up."""
-        import time
+        """One feed page, one request at a time at `pace` seconds apart, from the 30-minute page cache when the same
+        search was made recently. The feed now and then answers 404 / 429 / 5xx for a valid search under load, so it is
+        asked again a few times after a growing pause; a last failure is reported and only that search is given up."""
+        if self.stats is None:
+            self.stats = {"pages": 0, "cached_pages": 0, "queries": 0, "ads_seen": 0, "title_matches": 0}
+        ck = "&".join(f"{k}={params[k]}" for k in sorted(params))
+        now = time.time()
+        with _PAGE_LOCK:
+            hit = _PAGE_CACHE.get(ck)
+        if hit and now - hit[0] < PAGE_CACHE_SECONDS:
+            self.stats["cached_pages"] = self.stats.get("cached_pages", 0) + 1
+            return ET.fromstring(hit[1])
         for attempt in range(self.retries + 1):
             try:
-                r = self.http.get(FEED, params=params, headers={"Accept": "application/xml"})
-                return ET.fromstring(r.content)
+                try:
+                    r = self.http.get(FEED, params=params, headers={"Accept": "application/xml"}, interval=self.pace)
+                except TypeError:          # a test double without the `interval` argument
+                    r = self.http.get(FEED, params=params, headers={"Accept": "application/xml"})
+                root = ET.fromstring(r.content)
+                self.stats["pages"] = self.stats.get("pages", 0) + 1
+                with _PAGE_LOCK:
+                    if len(_PAGE_CACHE) >= PAGE_CACHE_MAX:
+                        for k in sorted(_PAGE_CACHE, key=lambda k: _PAGE_CACHE[k][0])[: PAGE_CACHE_MAX // 4]:
+                            _PAGE_CACHE.pop(k, None)
+                    _PAGE_CACHE[ck] = (time.time(), r.content)
+                return root
             except (requests.RequestException, ET.ParseError) as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 wait = self.retry_pause * (attempt + 1)
-                # (5xx / connection errors are already retried by the HTTP client)
-                if attempt < self.retries and code == 404 and time.monotonic() + wait < end:
+                # (5xx / 429 / connection errors are already retried by the HTTP client)
+                if attempt < self.retries and code in (404, 429) and time.monotonic() + wait < end:
                     time.sleep(wait)
                     continue
-                if code == 404:
-                    msg = "nhsjobs: the NHS Jobs feed did not answer some searches (404) - try again"
+                if code in (404, 429):
+                    msg = "nhsjobs: the NHS Jobs feed did not answer some searches (404/429) - try again"
                     if msg not in self.warnings:
                         self.warnings.append(msg)
                 else:
@@ -299,12 +339,18 @@ class NHSJobsSource(Source):
         g = lambda k: (v.findtext(k) or "").strip()  # noqa: E731
         desc = html_to_text(g("description"))
         locs = [l.text.strip() for l in v.findall("locations/location") if l.text]
+        url = re.sub(r"^https?://beta\.jobs\.nhs\.uk", f"https://{FEED_HOST}", g("url"))   # the public site's address
         job = Job(title=g("title"), company=g("employer"), location="; ".join(locs),
-                  posted_date=to_iso_date(g("postDate")[:10]), description=desc, url=g("url"),
+                  posted_date=to_iso_date(g("postDate")[:10]), description=desc, url=url,
                   source="nhsjobs", employment_type=normalise_employment_type(g("type")),
                   remote=detect_remote(" ".join(locs), g("title")), salary_raw=g("salary") or None,
                   closing_date=to_iso_date(g("closeDate")[:10]) or None)
         pay, hours = pay_and_hours(g("salary"), desc)
+        band = _BAND.search(f"{g('title')} {desc}")
+        if band and pay and "band" not in pay.lower():
+            pay = f"{pay} (Band {band.group(1).upper()})"
+        elif band and not pay:
+            pay = f"Band {band.group(1).upper()}"
         job.salary_raw, job.hours = pay or None, hours or None
         sal = find_salary_in_text(pay)
         if sal:

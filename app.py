@@ -22,7 +22,7 @@ from ui_theme import badge, clean, days_to_close, empty_state, inject_css
 
 ENV_FILE = Path(__file__).with_name(".env")
 PASSWORD_FILE = Path(__file__).with_name(".app_password")
-KEY_NAMES = ["REED_API_KEY", "ADZUNA_APP_ID", "ADZUNA_APP_KEY"]
+KEY_NAMES: list[str] = []      # no keyed sources: Job Finder uses open, key-free sources only
 
 # ---------------------------------------------------------------- helpers
 def read_env() -> dict:
@@ -65,7 +65,7 @@ def add_company(slug: str) -> None:
     st.session_state["companies_text"] = "\n".join(current)
 
 
-JOB_DEFAULTS = {"j_mode": "Any", "j_chip": None, "j_company_pick": None, "j_f_soon": False, "j_f_sort": "Best match",
+JOB_DEFAULTS = {"j_mode": "Any", "j_chip": None, "j_company_pick": None, "j_f_soon": False, "j_f_sort": "Best match", "j_f_sector": "All",
                 "j_keywords": "", "j_location": "", "j_urls": "", "j_max": 1000, "j_all_presets": True,
                 "j_remote_uk": True, "j_hide_contacts": False, "j_delay": 1.0, "j_follow": 25,
                 "j_f_text": "", "j_f_sources": [], "j_f_salary": False, "j_f_remote": False, "j_f_email": False, "j_f_contract": "Any",
@@ -293,7 +293,7 @@ def jobs_page():
 
 def _job_options():
     """Where to look and the other options, folded away so the search stays simple (and phone-sized)."""
-    with st.expander("⚙️ More options · sources, companies, keys"):
+    with st.expander("⚙️ More options · sources, companies, links"):
         st.markdown("**Where to look**")
         chosen = []
         cols = st.columns(2)
@@ -328,22 +328,7 @@ def _job_options():
                      placeholder="https://jobs.lever.co/spotify\nhttps://www.example.com/careers/senior-engineer")
         st.caption("Works for sites that publish standard job data (most modern careers sites) and for RSS job feeds. "
                    "Sites that ask not to be scraped (robots.txt) are skipped automatically.")
-
-        st.markdown("**🔑 API keys for Reed / Adzuna (optional)**")
-        st.caption("Keys are used for this session only, unless you tick 'Remember'.")
-        st.text_input("Reed API key", type="password", key="REED_API_KEY",
-                      help="Free from https://www.reed.co.uk/developers/jobseeker")
-        st.text_input("Adzuna app ID", key="ADZUNA_APP_ID", help="Free from https://developer.adzuna.com/")
-        st.text_input("Adzuna app key", type="password", key="ADZUNA_APP_KEY")
-        remember = st.checkbox("Remember these keys on this computer")
-        if remember:
-            st.warning(f"Keys will be saved in plain text to `{ENV_FILE}`. Anyone with access to this computer can read them.")
-        if ENV_FILE.exists() and any(saved.get(k) for k in KEY_NAMES):
-            st.caption("✅ Saved keys loaded from .env")
-            if st.button("Forget saved keys"):
-                forget_env()
-                st.rerun()
-    return chosen, remember
+    return chosen, False
 
 
 def _add_company_pick() -> None:
@@ -358,7 +343,8 @@ def _apply_jobs(t) -> None:
     st.session_state["results"] = [j.to_dict() for j in res.jobs]
     st.session_state["searched_at"] = f"{t.label} · {datetime.now().strftime('%d %b %Y %H:%M')}"
     st.session_state["jobs_sources"] = getattr(t, "lines", [])
-    for k in ("j_f_text", "j_f_sources", "j_f_contract"):  # new search -> clear old table filters
+    st.session_state["jobs_agencies"] = int(getattr(res, "agencies_removed", 0) or 0)
+    for k in ("j_f_text", "j_f_sources", "j_f_contract", "j_f_sector"):  # new search -> clear old table filters
         st.session_state[k] = JOB_DEFAULTS[k]
     for k in ("j_f_salary", "j_f_remote", "j_f_email", "j_f_soon"):
         st.session_state[k] = False
@@ -406,6 +392,10 @@ def show_job_results() -> None:
         st.markdown(f'<div class="jf-note">⚠️ <b>Partial results:</b> {len(problems)} of the sources had a problem '
                     "and were skipped. Open <i>Where the jobs came from</i> for details, or search again later.</div>",
                     unsafe_allow_html=True)
+    n_ag = int(st.session_state.get("jobs_agencies") or 0)
+    if n_ag:
+        st.caption(f"🚫 {n_ag} ad{'s' if n_ag != 1 else ''} posted by recruitment / staffing agencies left out: "
+                   "Job Finder lists direct employers only.")
     if srclines:
         with st.expander("Where the jobs came from"):
             st.markdown("  \n".join(srclines))
@@ -418,6 +408,10 @@ def show_job_results() -> None:
     summary_box = st.container(key="metrics")    # filled below, once the filters have been applied
 
     # ---- filters (instant, no new search)
+    if (df["sector"] != "").any():
+        st.segmented_control("NHS or independent", ["All", "NHS", "Independent"], key="j_f_sector", selection_mode="single",
+                             help="NHS = adverts on NHS Jobs / NHS Scotland / HSC NI by NHS bodies and GP practices; "
+                                  "Independent = private and independent providers (Spire, Bupa, Practice Plus Group, hospices, clinics…)")
     q = st.text_input("🔍 Filter these results", placeholder="type to filter by title, company, location or description",
                       key="j_f_text")
     with st.expander("Filters & sort"):
@@ -437,7 +431,8 @@ def show_job_results() -> None:
 
         def reset_filters():
             st.session_state.update({"j_f_text": "", "j_f_sources": [], "j_f_salary": False, "j_f_remote": False,
-                                     "j_f_email": False, "j_f_contract": "Any", "j_f_soon": False, "j_f_sort": "Best match"})
+                                     "j_f_email": False, "j_f_contract": "Any", "j_f_soon": False, "j_f_sort": "Best match",
+                                     "j_f_sector": "All"})
         st.button("Reset filters", on_click=reset_filters, key="jobs_reset_filters")
 
     view = df
@@ -450,6 +445,9 @@ def show_job_results() -> None:
         view = view[mask]
     if srcs:
         view = view[view["where_found"].isin(srcs)]
+    sector = st.session_state.get("j_f_sector") or "All"
+    if sector != "All":
+        view = view[view["sector"] == sector]
     if contract != "Any" and "contract" in view.columns:
         view = view[view["contract"] == ("permanent" if contract == "Permanent" else "temporary")]
     if only_salary:
@@ -481,7 +479,7 @@ def show_job_results() -> None:
         if mode == "Table":
             _job_table(view, hide_contacts)
         else:
-            sig = f"{len(view)}|{q}|{sort}|{contract}|{only_salary}|{only_remote}|{only_email}|{soon}|{srcs}"
+            sig = f"{len(view)}|{q}|{sort}|{contract}|{only_salary}|{only_remote}|{only_email}|{soon}|{srcs}|{sector}"
             n = pager("j_pager", sig, len(view))
             rows = view.head(n).to_dict(orient="records")
             st.markdown("".join(job_card(r, hide_contacts) for r in rows), unsafe_allow_html=True)
@@ -495,7 +493,7 @@ def show_job_results() -> None:
 def _job_table(view: pd.DataFrame, hide_contacts: bool) -> None:
     st.caption("Click a column header to sort · tick a row's box to read the full ad below · "
                "hover the table for 🔍 search and ⬇ quick download.")
-    cols = ["title", "url", "company", "location", "salary", "employment_type", "hours", "closing_date",
+    cols = ["title", "url", "company", "sector", "location", "salary", "employment_type", "hours", "closing_date",
             "posted_date", "remote"]
     if not hide_contacts:
         cols += ["contact_email", "contact_phone"]
@@ -506,7 +504,8 @@ def _job_table(view: pd.DataFrame, hide_contacts: bool) -> None:
         column_config={
             "title": st.column_config.TextColumn("Job title", width="large", pinned=True),
             "url": st.column_config.LinkColumn("Job ad", display_text="Open ad ↗", width="small"),
-            "company": "Company", "location": st.column_config.TextColumn("Location", width="medium"),
+            "company": "Company", "sector": st.column_config.TextColumn("NHS / Indep.", width="small"),
+            "location": st.column_config.TextColumn("Location", width="medium"),
             "salary": "Salary",
             "posted_date": st.column_config.DateColumn("Posted", format="D MMM YYYY"),
             "employment_type": "Type", "remote": "Remote", "where_found": "Found on",

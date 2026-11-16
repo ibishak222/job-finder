@@ -43,8 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
 """)
     p.add_argument("-s", "--sources", nargs="+", metavar="SRC",
                    help=f"sources to use: {', '.join(SOURCES)} or 'all'. Default: {' '.join(DEFAULT_SOURCES)} "
-                        "plus greenhouse/lever/ashby if --companies is given, jsonld if --urls is given, "
-                        "reed/adzuna if their API keys are set.")
+                        "plus greenhouse/lever/ashby if --companies is given and jsonld if --urls is given.")
     p.add_argument("-k", "--keyword", action="append",
                    help="keyword filter (title/company/description). Comma-separated or repeated = OR; "
                         "words within one keyword must all appear. e.g. -k 'data engineer,analytics'")

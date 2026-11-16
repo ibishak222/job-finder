@@ -19,6 +19,7 @@ from .directories import OpenStreetMapProvider, TeamPageProvider
 from .matching import RoleMatcher
 from .social import BlueskyProvider, MastodonProvider
 from .research import RESEARCH_NOTE, EuropePMCProvider, is_health_role
+from ..agencies import is_agency_employer
 from .employers import EmployerLead, EmployerLeadsFinder, employer_kinds
 
 PEOPLE_SOURCES = ("github", "bluesky", "mastodon", "openstreetmap")
@@ -53,6 +54,7 @@ class CandidateResult:
     research_count: int = 0    # Europe PMC research contacts (counted separately from candidates)
     employers: list[EmployerLead] = field(default_factory=list)   # organisations to contact - NOT candidates
     employers_note: str = ""
+    agencies_removed: int = 0     # recruitment / staffing agencies left out (employers, businesses, hiring contacts)
 
 
 EMPLOYER_DEADLINE_SECONDS = 110.0   # whole-search target; the employer stage is cut to fit (partial lists, noted)
@@ -399,6 +401,9 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
     # people must match the job in their own profile text; never pad with location-only results
     found = [c for c in found if c.kind != "candidate" or (c.match_score or 0) > 0]
     uniq = merge_similar(merge_duplicates(found))
+    # direct employers only: a business listing or hiring contact that belongs to a recruitment / staffing agency is dropped
+    n_ag = sum(1 for c in uniq if c.kind != "candidate" and is_agency_employer(c.name or c.company))
+    uniq = [c for c in uniq if c.kind == "candidate" or not is_agency_employer(c.name or c.company)]
     entries = suppression.load() if suppression_entries is None else suppression_entries
     uniq, result.suppressed = suppression.apply(uniq, entries)
     want = RoleMatcher(title).contract or ("" if contract in ("any", "", None) else contract)
@@ -477,6 +482,7 @@ def find_candidates(title: str, postcode: str, radius_miles: float = 10, min_exp
         try:
             result.employers, n = finder.find(title, place, radius_miles, entries, progress)
             result.suppressed += n
+            result.agencies_removed = n_ag + int(finder.stats.get("agencies_removed", 0))
             rep.found = len(result.employers)
         except SearchCancelled:
             raise

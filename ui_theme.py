@@ -63,6 +63,7 @@ a { text-decoration: none; }
 .jf-badge.warn { background:#fee2e2; color:#991b1b; border-color:#fecaca; }
 .jf-badge.info { background:#e0f2fe; color:#075985; }
 .jf-badge.neutral { background:#f1f5f9; color:#475569; }
+.jf-badge.indep { background:#f3e8ff; color:#6b21a8; border-color:#e9d5ff; }
 .jf-actions { display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.55rem; }
 .jf-btn { display:inline-flex; align-items:center; gap:.3rem; min-height:38px; padding:.3rem .85rem; border-radius:10px;
   border:1px solid var(--jf-line); background:#fff; color:var(--jf-ink) !important; font-size:.86rem; font-weight:600;

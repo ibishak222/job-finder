@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import zip_longest
 from typing import Callable, Optional
 
+from .agencies import is_agency_job
 from .http import HttpClient
 from .models import Job
 from .sources import SOURCES
@@ -131,12 +132,14 @@ class SourceResult:
     fetched: int = 0
     matched: int = 0
     message: str = ""
+    agencies: int = 0       # ads dropped because a recruitment / staffing agency posted them
 
 
 @dataclass
 class SearchResult:
     jobs: list[Job] = field(default_factory=list)
     sources: list[SourceResult] = field(default_factory=list)
+    agencies_removed: int = 0   # ads left out because the advertiser is a recruitment / staffing / locum agency
 
 
 ProgressFn = Callable[[str, str, SourceResult | None], None]  # (source, event, result)
@@ -200,6 +203,9 @@ def search(sources: list[str], *, keywords: list[str] = (), locations: list[str]
                 if not matches(job, keywords, [] if getattr(src, "server_side_location", False) and locations
                                else locations, remote_uk, temporary=contract == "temporary"):
                     continue
+                if is_agency_job(job):          # direct employers only: never another recruiter's ad
+                    r.agencies += 1
+                    continue
                 if salary_only and not (job.salary_min or job.salary_max):
                     continue
                 if remote_only and not job.remote:
@@ -221,6 +227,9 @@ def search(sources: list[str], *, keywords: list[str] = (), locations: list[str]
                 r.status = "error"
         elif r.status == "ok" and r.fetched == 0:
             r.message = "no jobs returned"
+        if r.agencies:
+            r.message = "; ".join(filter(None, [r.message, f"{r.agencies} agency ad{'s' if r.agencies != 1 else ''} "
+                                                           "left out (direct employers only)"]))
         if getattr(src, "info", None):     # notes that aren't errors (e.g. far-away results dropped)
             r.message = "; ".join(filter(None, [r.message] + list(src.info)))
         if name == "jsonld" and r.status == "ok" and r.fetched == 0:
@@ -261,6 +270,7 @@ def search(sources: list[str], *, keywords: list[str] = (), locations: list[str]
             r.matched = len(uniq)
         result.sources.append(r)
 
+    result.agencies_removed = sum(r.agencies for r in by_name.values())
     jobs = [j for group in zip_longest(*buckets.values()) for j in group if j is not None]
     if max_results:
         jobs = jobs[:max_results]
@@ -280,4 +290,4 @@ def default_sources(companies: list[str], urls: list[str]) -> list[str]:
                      if s in prefixed or (not prefixed and s in ("greenhouse", "lever", "ashby"))]
     if urls:
         selected += ["jsonld", "rss"]
-    return selected + ["reed", "adzuna"]
+    return selected

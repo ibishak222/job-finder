@@ -36,6 +36,9 @@ def job_card(r: dict, hide_contacts: bool = False) -> str:
     t_html = (f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(title)}</a>' if url else esc(title))
     ctext, ckind = contract_badge(r.get("contract"), r.get("employment_type"), title)
     badges = []
+    sector = clean(r.get("sector"))
+    if sector:
+        badges.append(badge(sector, "info" if sector == "NHS" else "indep"))
     if ctext:
         badges.append(badge(ctext, ckind))
     if clean(r.get("remote")) == "Yes":
@@ -128,6 +131,8 @@ def employer_card(r: dict, locum_friendly: bool = False) -> str:
     web = safe_url(r.get("website"))
     n_html = f'<a href="{esc(web)}" target="_blank" rel="noopener noreferrer">{esc(name)}</a>' if web else esc(name)
     badges = [badge(clean(r.get("employer_type")) or "Employer", "neutral")]
+    if clean(r.get("sector")):
+        badges.insert(0, badge(clean(r.get("sector")), "info" if clean(r.get("sector")) == "NHS" else "indep"))
     vt = clean(r.get("vacancy_type"))
     if locum_friendly:
         badges.append(badge("Locum / bank friendly", "locum"))

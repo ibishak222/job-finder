@@ -8,6 +8,7 @@ import pandas as pd
 from recruit_scraper.display import format_salary
 from recruit_scraper.models import Job
 from recruit_scraper.presets import PRESET_COMPANIES
+from recruit_scraper.sector import job_sector
 from recruit_scraper.utils import contract_bucket
 from ui_common import to_csv_bytes, to_excel_bytes, to_json_bytes
 
@@ -36,8 +37,6 @@ SOURCE_INFO = {
     "nhsscotland": ("NHS Scotland Jobs", "NHS boards in Scotland (apply.jobs.scot.nhs.uk): staff bank, fixed-term and "
                     "permanent nursing posts, with pay, hours and closing date.", True),
     "hscni": ("HSC Northern Ireland jobs", "HSC trusts and GP federations in Northern Ireland (jobs.hscni.net).", True),
-    "reed": ("Reed.co.uk (UK)", "Big UK job board – needs a free Reed API key.", True),
-    "adzuna": ("Adzuna (UK)", "UK job search engine – needs a free Adzuna app ID + key.", True),
 }
 
 PRESETS = {name: slug for slug, name, _ in PRESET_COMPANIES}
@@ -58,6 +57,7 @@ def jobs_to_frame(jobs: list[dict]) -> pd.DataFrame:
                             for r in df.itertuples()])
     df["posted_date"] = pd.to_datetime(df["posted_date"], errors="coerce").dt.date
     df["where_found"] = df["source"].map(source_label)
+    df["sector"] = [job_sector(a, b) for a, b in zip(df["source"], df["company"].fillna(""))]
     df["remote"] = df["remote"].map({True: "Yes", False: "No"}).fillna("")
     df["contract"] = [contract_bucket(t) for t in df["employment_type"]]
     df["closing_date"] = pd.to_datetime(df["closing_date"], errors="coerce").dt.date
@@ -71,7 +71,7 @@ EXPORT_COLUMNS = {  # column -> friendly header (Excel/CSV). JSON keeps the plai
     "salary_min": "Salary min", "salary_max": "Salary max", "salary_currency": "Currency", "salary_period": "Salary period",
     "posted_date": "Posted", "employment_type": "Type", "remote": "Remote", "contact_email": "Contact email",
     "contact_phone": "Contact phone", "url": "Job link", "where_found": "Found on", "source": "Source id",
-    "closing_date": "Closing date", "hours": "Hours / sessions", "salary_raw": "Pay as written", "description": "Description", "scraped_at": "Collected at (UTC)",
+    "closing_date": "Closing date", "hours": "Hours / sessions", "sector": "NHS / Independent", "salary_raw": "Pay as written", "description": "Description", "scraped_at": "Collected at (UTC)",
 }
 CONTACT_COLS = ("contact_email", "contact_phone")
 

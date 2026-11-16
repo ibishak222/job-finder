@@ -32,6 +32,7 @@ import io
 import logging
 import re
 import tempfile
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,7 @@ from typing import Callable, Iterable, Iterator, Optional
 
 import requests
 
+from ..agencies import is_agency_employer
 from ..http import HttpClient
 from ..utils import find_emails
 from .cache import DiskCache
@@ -68,6 +70,8 @@ BSO_PAGE = ("https://bso.hscni.net/directorates/operations/family-practitioner-s
             "contractor-information/northern-ireland-gp-practice-lists-for-professional-use/")
 RQIA_XLSX = "https://www.rqia.org.uk/download/32/services-registered-with-rqia/4452/all-registered-services.xlsx"
 RQIA_PAGE = "https://www.rqia.org.uk/what-we-do/register/"
+HIW_CSV = "https://www.hiw.org.uk/service-directory.csv"
+HIW_PAGE = "https://www.hiw.org.uk/service-index"
 
 LICENCES = {
     "CQC": "CQC data (Open Government Licence v3.0)",
@@ -80,6 +84,7 @@ LICENCES = {
     "PHS": "Public Health Scotland open data (Open Government Licence v3.0)",
     "HSC BSO": "HSC Business Services Organisation practice list (published for professional use)",
     "RQIA": "RQIA register of services (Northern Ireland)",
+    "HIW": "Healthcare Inspectorate Wales service directory (public register; check HIW's terms before re-use)",
 }
 
 # postcode areas -> UK nation (border areas count for both sides)
@@ -165,6 +170,8 @@ class RegRow:
     distance: Optional[float] = None
     tags: str = ""            # register-specific filter text (service types, practice areas, activities)
     named_person: bool = False
+    sector: str = ""          # 'NHS' | 'Independent' | '' (not a health-sector split, e.g. a care home or a school)
+    extra: str = ""           # provider name and specialisms (CQC), used only to tell NHS from independent
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -282,10 +289,49 @@ CQC_TYPES = {"gp": ("Doctors/GPs",), "care_home": ("Residential homes", "Nursing
              "urgent_care": ("Urgent care centres", "Mobile doctors"),
              "mental_health": ("Hospitals - Mental health/capacity", "Community services - Mental Health",
                                "Community services - Learning disabilities")}
-# CQC has no 'nurses agency' service type: nurse / staffing agencies are registered as homecare agencies, so they are
-# recognised by name (used for locum / bank searches)
-NURSE_AGENCY_NAME = re.compile(r"\bnurs(e|es|ing)\b|staffing|locum|recruit|relief|medical (staff|personnel)|"
-                               r"healthcare (staff|personnel|professionals)|personnel|agency", re.I)
+# Independent (private) health providers in CQC's directory. CQC does not flag NHS vs independent, so a location is
+# 'independent' when its provider is not an NHS body (trust, board, ICB, council, PCN / federation) and it is a
+# clinic / hospital / private doctors' service (not a care home, and not an NHS-looking GP practice).
+NHS_PROVIDER = re.compile(r"\bNHS\b|foundation trust|health board|integrated care|\bcouncil\b|primary care network|"
+                          r"federation|\bPCN\b|hospitals? trust|\btrust\b|\bICB\b|\bCCG\b|\bgp collaborative\b", re.I)
+PRIVATE_NAME = re.compile(r"\bprivate\b|aesthetic|cosmetic|\bclinic\b|laser|\bskin\b|dermatolog|botox|beauty|travel|vaccin|"
+                          r"occupational|screening|wellbeing|well-being|wellness|\bbupa\b|spire|nuffield|ramsay|circle health|"
+                          r"\bhca\b|london bridge|priory|harley street|\bdoctors? (on|at|direct|now)\b|online (gp|doctor)|"
+                          r"\bmedical (services|solutions|group ltd)\b|health ?screen|fertility|ivf|weight|slimming|"
+                          r"hair|dental|physio|osteo|chiropract|podiatr|hospital", re.I)
+NHS_LOOKING_PRACTICE = re.compile(r"\bsurgery\b|medical (centre|center|practice|group)|health ?cent(re|er)|group practice|"
+                                  r"family practice|partnership|\bpractice\b|\bdrs?\b\.?\s|doctors", re.I)
+INDEP_CQC_TYPES = {"Clinic": "Independent clinic", "Hospital": "Independent hospital",
+                   "Hospitals - Mental health/capacity": "Independent mental health hospital",
+                   "Mobile doctors": "Private doctors' service", "Doctors/GPs": "Private GP service",
+                   "Diagnosis/screening": "Independent clinic (screening / diagnostics)",
+                   "Phone/online advice": "Online / telephone doctor service"}
+_INDEP_NAME_LABELS = [(re.compile(r"occupational", re.I), "Occupational health service"),
+                      (re.compile(r"travel|vaccin|immunis", re.I), "Travel / vaccination clinic"),
+                      (re.compile(r"aesthetic|cosmetic|botox|laser|\bskin\b|dermal|beauty|hair", re.I), "Aesthetic clinic")]
+
+
+def independent_label(name: str, types: list[str], provider: str, specialisms: str) -> str:
+    """Label for a CQC location that is an independent (private) health service, '' when it is not one."""
+    if NHS_PROVIDER.search(provider or "") or NHS_PROVIDER.search(name or "") or is_agency_employer(name):
+        return ""
+    cand = [t for t in INDEP_CQC_TYPES if t in types]
+    if not cand:
+        return ""
+    t = cand[0]
+    private_hint = bool(PRIVATE_NAME.search(f"{name} {provider}"))
+    if t == "Doctors/GPs":
+        only_everyone = (specialisms or "").strip() in ("", "Services for everyone")
+        if not (private_hint or (not only_everyone and not NHS_LOOKING_PRACTICE.search(name))):
+            return ""
+    elif t in ("Diagnosis/screening", "Phone/online advice") and not private_hint:
+        return ""
+    for rx, lab in _INDEP_NAME_LABELS:
+        if rx.search(name or ""):
+            return lab
+    return INDEP_CQC_TYPES[t]
+
+
 CQC_LABEL = {"Doctors/GPs": "GP practice", "Residential homes": "Care home", "Nursing homes": "Nursing home",
              "Homecare agencies": "Home care agency", "Supported living": "Supported living service",
              "Shared lives": "Shared lives scheme", "Dentist": "Dental practice", "Hospital": "Hospital",
@@ -300,7 +346,7 @@ CQC_LABEL = {"Doctors/GPs": "GP practice", "Residential homes": "Care home", "Nu
 
 class CQCDirectory(Register):
     key, label, kinds = "cqc", "CQC", {"gp", "care_home", "home_care", "dental", "hospital", "clinic", "community",
-                                       "urgent_care", "mental_health", "nurse_agency"}
+                                       "urgent_care", "mental_health", "independent"}
 
     def download(self, http, keep, budget):
         url = latest_link(http, CQC_PAGE, r'href="(https://www\.cqc\.org\.uk/system/files/[^"]+CQC_directory\.csv)"')
@@ -320,22 +366,37 @@ class CQCDirectory(Register):
             first = next((CQC_LABEL[t] for t in types.split("|") if t in CQC_LABEL), types.split("|")[0])
             yield RegRow(name=g("Name"), employer_type=first, postcode=pc, address=g("Address").replace(",", ", "),
                          phone=_phone(g("Phone number")), website=_site(g("Service's website (if available)")),
-                         source="CQC", source_url=g("Location URL"), tags=types)
+                         source="CQC", source_url=g("Location URL"), tags=types,
+                         extra=f"{g('Provider name')}§{g('Specialisms/services')}")
 
     def wanted(self, row, kinds, title):
         types = row.tags.split("|")
+        provider, _, spec = row.extra.partition("§")
+        if is_agency_employer(row.name) or is_agency_employer(provider):
+            return False        # recruitment / staffing / locum agencies (incl. 'homecare agencies' that only supply staff)
         hit = next((t for k in kinds for t in CQC_TYPES.get(k, ()) if t in types), None)
-        if not hit and "nurse_agency" in kinds and "Homecare agencies" in types and NURSE_AGENCY_NAME.search(row.name):
-            row.employer_type = "Nurse / staffing agency"
-            return True
         if hit:
             row.employer_type = CQC_LABEL.get(hit, hit)   # label by the service type that matched the role
+            if hit == "Dentist":
+                row.sector = "Independent"                 # dental practices are independent businesses (some NHS-funded)
+            elif NHS_PROVIDER.search(provider) and hit in ("Hospital", "Urgent care centres", "Community services - Nursing",
+                                                           "Community services - Healthcare", "Doctors/GPs"):
+                row.sector = "NHS"
+            if hit not in ("Doctors/GPs",) or "independent" not in kinds:
+                if not row.sector and hit in ("Hospital", "Clinic", "Hospitals - Mental health/capacity", "Hospice") \
+                        and independent_label(row.name, types, provider, spec):
+                    row.sector = "Independent"             # same service type, but run by a private / independent provider
+                return True
+        if "independent" in kinds:
+            lab = independent_label(row.name, types, provider, spec)
+            if lab:
+                row.employer_type, row.sector = lab, "Independent"
+                return True
         return bool(hit)
 
 
 class CareInspectorate(Register):
-    key, label, kinds = "careinsp", "Care Inspectorate", {"care_home", "home_care", "hospital", "clinic",
-                                                          "nurse_agency"}
+    key, label, kinds = "careinsp", "Care Inspectorate", {"care_home", "home_care", "hospital", "clinic"}
     nations = {"Scotland"}
 
     def download(self, http, keep, budget):
@@ -367,11 +428,11 @@ class CareInspectorate(Register):
     def wanted(self, row, kinds, title):
         t = row.tags
         nurse = re.search(r"\bnurs|\brgn\b|\brmn\b", title, re.I)
+        if t.startswith("Nurse Agency") or is_agency_employer(row.name):
+            return False        # nurse / staffing agencies are recruiters, not employers
         return (("care_home" in kinds and t.startswith("Care Home Service"))
                 or ("home_care" in kinds and (t.startswith("Housing Support") or "Care at Home" in t))
-                or ("nurse_agency" in kinds and t.startswith("Nurse Agency"))
-                or (bool(nurse) and "gp" not in kinds and (t.startswith("Nurse Agency")
-                                                          or t.startswith("Care Home Service|Older"))))
+                or (bool(nurse) and "gp" not in kinds and t.startswith("Care Home Service|Older")))
 
 
 class ODSPractices(Register):
@@ -631,10 +692,53 @@ class NIPractices(Register):
                          source_url=f"{BSO_PAGE}#{g('PracNo')}", tags=g("LCG"))
 
 
+class HIWRegister(Register):
+    """Healthcare Inspectorate Wales' public service directory (a CSV the regulator publishes): independent hospitals,
+    clinics and dental practices in Wales with their published phone number."""
+    key, label, kinds = "hiw", "HIW", {"independent", "dental"}
+    nations = {"Wales"}
+
+    def download(self, http, keep, budget):
+        header = None
+        for row in stream_csv(http, HIW_CSV, budget):
+            if header is None:
+                header = {h: i for i, h in enumerate(row)}
+                continue
+            g = lambda h: row[header[h]].strip() if h in header and header[h] < len(row) else ""
+            pc = pc_norm(g("Postcode"))
+            if not pc or not keep(outcode(pc)):
+                continue
+            kind = g("Type of establishment")
+            yield RegRow(name=g("Service name"), employer_type=kind, postcode=pc,
+                         address=", ".join(filter(None, [g("Address line 1"), g("Address line 2")])),
+                         phone=_phone(g("Telephone").lstrip("'")), source="HIW", source_url=f"{HIW_PAGE}",
+                         tags=f"{kind}|{g('Sector')}|{g('Services provided')}")
+
+    def wanted(self, row, kinds, title):
+        kind, sector, services = (row.tags.split("|") + ["", ""])[:3]
+        if "Private/Independent" not in sector or is_agency_employer(row.name):
+            return False
+        if kind == "Dental Practices":
+            ok = "dental" in kinds
+            row.employer_type = "Dental practice"
+        elif kind in ("Hospitals", "Clinics"):
+            ok = "independent" in kinds
+            row.employer_type = "Independent hospital" if kind == "Hospitals" else "Independent clinic"
+            for rx, lab in _INDEP_NAME_LABELS:
+                if rx.search(row.name + " " + services):
+                    row.employer_type = lab
+                    break
+        else:
+            ok = False
+        if ok:
+            row.sector = "Independent"
+        return ok
+
+
 class RQIARegister(Register):
     """Northern Ireland's register of care services (RQIA): nursing homes and nursing agencies with the
     registered manager named by the regulator."""
-    key, label, kinds = "rqia", "RQIA", {"care_home", "home_care", "nurse_agency"}
+    key, label, kinds = "rqia", "RQIA", {"care_home", "home_care", "independent", "dental"}
     nations = {"Northern Ireland"}
 
     def download(self, http, keep, budget):
@@ -654,13 +758,23 @@ class RQIARegister(Register):
     def wanted(self, row, kinds, title):
         t = row.tags
         nurse = bool(re.search(r"\bnurs|\brgn\b|\brmn\b", title, re.I))
-        return (("nurse_agency" in kinds and t.startswith("Nursing Agency"))
-                or ("care_home" in kinds and (t.startswith("Nursing (") or (not nurse and t.startswith("Residential"))))
+        if t.startswith("Nursing Agency") or is_agency_employer(row.name):
+            return False        # nursing agencies are recruiters, not employers
+        if "independent" in kinds and re.match(r"Independent (Hospital \(IH\)$|Clinic|Medical Agency)", t):
+            row.sector = "Independent"
+            row.employer_type = ("Independent hospital" if t.startswith("Independent Hospital") else
+                                 "Independent clinic" if t.startswith("Independent Clinic") else
+                                 "Private doctors' service (IMA)")
+            return True
+        if "dental" in kinds and "Dental Treatment" in t:
+            row.sector, row.employer_type = "Independent", "Dental practice"
+            return True
+        return (("care_home" in kinds and (t.startswith("Nursing (") or (not nurse and t.startswith("Residential"))))
                 or ("home_care" in kinds and t.startswith("Domiciliary Care")))
 
 
 REGISTERS: list[Register] = [CQCDirectory(), CareInspectorate(), ODSPractices(), PHSScotlandPractices(),
-                             NIPractices(), RQIARegister(), ODSNursePrescribers(), GIASSchools(), CharityRegister(),
+                             NIPractices(), RQIARegister(), HIWRegister(), ODSNursePrescribers(), GIASSchools(), CharityRegister(),
                              BarristersRegister()]
 FALLBACKS = {"cqc": ODSCareHomes()}
 
@@ -685,6 +799,15 @@ def contact_score(r) -> int:
     return 4 * bool(r.email) + 2 * bool(r.website) + 2 * bool(r.phone) + bool(r.contact_name)
 
 
+_AGENCY_TAG = re.compile(r"nurses? agency|nursing agency|employment agency|staffing", re.I)
+
+
+def _agency_row(r: "RegRow") -> bool:
+    """A register entry that is a nurse / staffing / recruitment agency (never listed: Job Finder is for direct employers)."""
+    provider = (r.extra or "").partition("§")[0]
+    return bool(_AGENCY_TAG.search(r.tags or "") or is_agency_employer(r.name) or is_agency_employer(provider))
+
+
 @dataclass
 class RegistersFinder:
     http: Optional[HttpClient] = None
@@ -697,6 +820,7 @@ class RegistersFinder:
     def __post_init__(self):
         self.http = self.http or HttpClient(min_interval=1.0, timeout=30, retries=1, backoff=2)
         self.cache = DiskCache("registers", TTL)
+        self._lock = threading.Lock()
 
     per_area_uk: int = 3           # whole-UK search: rows kept per postcode area (most contactable first)
 
@@ -818,6 +942,10 @@ class RegistersFinder:
                                           f"{'-'.join(sorted(kinds))}:{title.lower().strip()}") if uk
                            else self.subset(attempt, wanted, budget))
                     rows = [r for r in got if attempt.wanted(r, kinds, title)]
+                    n_ag = sum(1 for r in got if _agency_row(r))
+                    if n_ag:
+                        with self._lock:
+                            self.stats["agencies"] = self.stats.get("agencies", 0) + n_ag   # recruiters left out
                     rows.sort(key=lambda r: (-contact_score(r), r.postcode) if uk else rank.get(outcode(r.postcode), 999))
                     self.stats[attempt.key] = len(rows)
                     return rows[: self.max_rows]

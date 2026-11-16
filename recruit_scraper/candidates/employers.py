@@ -23,6 +23,7 @@ from typing import Callable, Iterable, Optional
 
 import requests
 
+from ..agencies import is_agency_employer
 from ..http import HttpClient
 from ..utils import find_emails
 from .cache import DiskCache
@@ -35,7 +36,7 @@ ODS = "https://directory.spineservices.nhs.uk/ORD/2-0-0/organisations"
 ODS_ROLES = {"gp": "RO76", "care_home": "RO269", "home_care": "RO270", "dental": "RO110", "pharmacy": "RO182"}
 TYPE_LABELS = {"gp": "GP practice", "care_home": "Care home / nursing home", "home_care": "Home care agency",
                "dental": "Dental practice", "pharmacy": "Pharmacy", "hospital": "Hospital", "clinic": "Clinic",
-               "urgent_care": "Urgent care / walk-in / out-of-hours", "nurse_agency": "Nursing agency",
+               "urgent_care": "Urgent care / walk-in / out-of-hours", "independent": "Independent clinic / private practice",
                "community": "Community nursing service", "trades": "Electrician / plumber / builder / trade firm",
                "accountancy": "Accountancy / tax practice", "law": "Law firm", "food": "Restaurant / pub / cafe / hotel",
                "mental_health": "Mental health / learning disability service"}
@@ -92,16 +93,27 @@ ROLE_EMPLOYERS: list[tuple[re.Pattern, list[str]]] = [
 _NURSING = re.compile(r"\bnurs|\brgn\b|\brmn\b|\banp\b|\bgpn\b|\bhca\b|health ?care assistant|practitioner|"
                       r"\bcare (worker|assistant)|carer|support worker|care co-?ordinator", re.I)
 
-# names that mark the employers a LOCUM / bank worker is placed by: agencies, urgent care and out-of-hours providers,
-# PCNs and GP federations / alliances / extended-access hubs
-LOCUM_EMPLOYER = re.compile(r"locum|nurse agency|nursing agency|staffing|recruit|relief|out[- ]of[- ]hours|\booh\b|"
-                            r"urgent care|walk-?in|federation|\bpcn\b|primary care network|gp (alliance|collaborative)|"
-                            r"extended access|\bhub\b|\bagency\b|bank staff|medical personnel", re.I)
+# names that mark the DIRECT employers a LOCUM / bank worker is booked by: urgent care and out-of-hours providers, PCNs
+# and GP federations / alliances / extended-access hubs, hospices, and NHS trusts' own staff banks. Recruitment, staffing
+# and locum AGENCIES are never listed (see recruit_scraper/agencies.py).
+LOCUM_EMPLOYER = re.compile(r"out[- ]of[- ]hours|\booh\b|urgent care|walk-?in|federation|\bpcn\b|primary care network|"
+                            r"gp (alliance|collaborative|cooperative|co-operative)|extended access|\bhub\b|\bhospice\b|"
+                            r"in-house bank|staff bank|nhs (foundation )?trust|foundation trust|health board", re.I)
 
 
 def locum_priority(lead: "EmployerLead") -> int:
-    """0 for the employers locum / bank staff are booked through, 1 for the rest."""
+    """0 for the direct employers that book locum / bank staff in bulk (urgent care, OOH, PCNs / federations, hubs, hospices,
+    trusts' own banks); 1 for the rest (GP practices, independent clinics, care homes - all direct employers too)."""
     return 0 if LOCUM_EMPLOYER.search(f"{lead.employer_type} {lead.name}") else 1
+
+
+_PRIVATE_TITLE = re.compile(r"\b(private|independent|self-?pay)\b", re.I)
+_CLINICAL_KINDS = {"gp", "hospital", "clinic", "urgent_care", "community", "mental_health"}
+
+
+def is_locum_search(title: str) -> bool:
+    from .matching import contract_type
+    return contract_type(title or "") == "temporary" and bool(_NURSING.search(title or ""))
 
 
 def employer_kinds(title: str) -> list[str]:
@@ -109,9 +121,12 @@ def employer_kinds(title: str) -> list[str]:
     for rx, kinds in ROLE_EMPLOYERS:
         if rx.search(title or ""):
             kinds = list(kinds)
-            if contract_type(title or "") == "temporary" and _NURSING.search(title or ""):
-                # locum / bank nursing: also out-of-hours / urgent care and the nursing agencies that place locums
-                kinds += [k for k in ("urgent_care", "nurse_agency") if k not in kinds]
+            if is_locum_search(title):
+                # locum / bank nursing: also out-of-hours / urgent care providers (direct employers; agencies are never listed)
+                kinds += [k for k in ("urgent_care",) if k not in kinds]
+            if _CLINICAL_KINDS & set(kinds) and "dental" not in kinds:
+                # independent / private GP services and clinics employ these roles too ('private practice nurse' first)
+                kinds = ["independent"] + kinds if _PRIVATE_TITLE.search(title or "") else kinds + ["independent"]
             return kinds
     return []
 
@@ -120,7 +135,7 @@ def employer_kinds(title: str) -> list[str]:
 def _tier(lead: "EmployerLead", kinds: list[str]) -> int:
     t = (lead.employer_type or "").lower()
     order = {"gp": r"gp practice|doctors", "urgent_care": r"urgent care|walk-in|out-of-hours",
-             "nurse_agency": r"nurse agency|nursing agency|nurse / staffing|staffing agency",
+             "independent": r"independent|private|aesthetic|occupational|travel / vaccination|online / telephone",
              "mental_health": r"mental health|learning disab", "community": r"community (nursing|health)",
              "care_home": r"care home|nursing home", "home_care": r"home care|care at home|housing support|domiciliary",
              "hospital": r"hospital|hospice", "clinic": r"clinic|community"}
@@ -158,6 +173,7 @@ class EmployerLead:
     vacancy_url: str = ""
     vacancy_type: str = ""    # 'locum / bank / temporary' or 'permanent / other', from the advert
     bank_url: str = ""        # a 'join our bank' / locum / flexible-staff page on the employer's website
+    sector: str = ""          # 'NHS' | 'Independent' | '' (health sector split; blank for care homes, schools, firms)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -217,10 +233,36 @@ def merge_leads(ods: list[EmployerLead], osm: list[EmployerLead]) -> list[Employ
         for f in ("phone", "email", "website", "address", "postcode"):
             if not getattr(hit, f) and getattr(o, f):
                 setattr(hit, f, getattr(o, f))
+        if o.sector and not hit.sector:
+            hit.sector = o.sector
         if o.source not in hit.source:
             hit.source += f" + {o.source}"
             hit.source_url = f"{hit.source_url} {o.source_url}".strip()
     return out
+
+
+_NHS_SOURCE = re.compile(r"NHS ODS|PHS|HSC BSO", re.I)
+_NHS_TYPE = re.compile(r"gp practice|doctors|community (nursing|health)|urgent care|walk-in|out-of-hours|nhs|"
+                       r"nurse prescriber", re.I)
+
+
+def assign_sector(lead: EmployerLead) -> str:
+    """'NHS' for NHS-contracted GP practices / NHS bodies (they come from the NHS ODS / PHS / BSO lists or have NHS in
+    the name), 'Independent' for private / independent providers from the regulators' registers, '' when the
+    NHS-or-independent split does not apply (care homes, schools, law firms…)."""
+    if lead.sector == "Independent" and not (_NHS_SOURCE.search(lead.source) and _NHS_TYPE.search(lead.employer_type)):
+        return "Independent"
+    if re.search(r"\bNHS\b|foundation trust|health board", lead.name, re.I):
+        return "NHS"
+    if _NHS_SOURCE.search(lead.source) and _NHS_TYPE.search(lead.employer_type):
+        return "NHS"       # an NHS-listed GP practice is NHS-contracted even when CQC also lists it
+    return lead.sector
+
+
+def drop_agencies(leads: list[EmployerLead]) -> tuple[list[EmployerLead], int]:
+    """Recruitment / staffing / locum agencies are other recruiters, not employers: never listed."""
+    kept = [l for l in leads if not is_agency_employer(l.name, l.employer_type)]
+    return kept, len(leads) - len(kept)
 
 
 def suppress_leads(leads: list[EmployerLead], entries: Iterable[str]) -> tuple[list[EmployerLead], int]:
@@ -423,7 +465,8 @@ class EmployerLeadsFinder:
                 email=(find_emails(t.get("email") or t.get("contact:email") or "") or [""])[0],
                 website=t.get("website") or t.get("contact:website") or t.get("url") or "",
                 source="OpenStreetMap", source_url=f"https://www.openstreetmap.org/{e.get('type', 'node')}/{e.get('id')}",
-                ods_code=t.get("ref:ODS") or t.get("ref:GB:nhs") or "", lat=lat, lon=lon))
+                ods_code=t.get("ref:ODS") or t.get("ref:GB:nhs") or "", lat=lat, lon=lon,
+                sector="Independent" if t.get("operator:type") in ("private", "commercial") else ""))
         self.stats["osm_places"] = len(out)
         return out
 
@@ -495,6 +538,7 @@ class EmployerLeadsFinder:
                                 contact_role=r.contact_role, address=r.address, postcode=r.postcode,
                                 distance_miles=r.distance, phone=r.phone, email=r.email, website=r.website,
                                 source=r.source, source_url=r.source_url, ods_code=r.ods_code, lat=r.lat, lon=r.lon,
+                                sector=r.sector,
                                 note=("Named in an official register - a professional at this workplace, not a "
                                       "job-seeker" if r.named_person else "Employer - not a candidate"))
             (named if r.named_person else emp).append(lead)
@@ -502,8 +546,8 @@ class EmployerLeadsFinder:
 
     # --- the practice's own website ----------------------------------------------------------------------------
     def _cap(self, leads: list[EmployerLead], kinds: list[str]) -> list[EmployerLead]:
-        """First max_leads, but each other kind asked for (nurse agencies, urgent care for a locum search) keeps a
-        share, so 250 GP practices can't push every agency out of the list."""
+        """First max_leads, but each other kind asked for (independent clinics, urgent care for a locum search) keeps a
+        share, so 250 GP practices can't push every other kind out of the list."""
         if len(leads) <= self.max_leads or len(kinds) < 2:
             return leads[: self.max_leads]
         share = self.max_leads // (2 * len(kinds))
@@ -617,13 +661,19 @@ class EmployerLeadsFinder:
                                            lambda: self.register_leads(kinds, title, place, radius_miles, progress),
                                            ([], []))
             leads = merge_leads(leads, reg_emp)
+        # direct employers only: recruitment / staffing / locum agencies are other recruiters
+        leads, n_ag = drop_agencies(leads)
+        named, n_ag2 = drop_agencies(named)
+        self.stats["agencies_removed"] = n_ag + n_ag2 + int(self.stats.pop("register_agencies", 0) or 0)
+        for l in leads + named:
+            l.sector = assign_sector(l)
         leads, n = suppress_leads(leads, entries)
         named, n2 = suppress_leads(named, entries)
         n += n2
         # the right kind of employer first, then nearest (in 3-mile bands) and most contactable
-        locum = "nurse_agency" in kinds   # a locum / bank search: agencies, urgent care, OOH, PCNs / federations first
+        locum = is_locum_search(title)   # a locum / bank search: urgent care, OOH, PCNs / federations, hospices first
         if locum:
-            kinds = ["nurse_agency", "urgent_care"] + [k for k in kinds if k not in ("nurse_agency", "urgent_care")]
+            kinds = ["urgent_care"] + [k for k in kinds if k != "urgent_care"]
         tiered = len(kinds) <= 3 or locum   # a broad title ('nurse') keeps every kind of employer mixed by distance
         leads.sort(key=lambda l: (locum_priority(l) if locum else 0, _tier(l, kinds) if tiered else 0,
                                   l.distance_miles is None, int((l.distance_miles or 0) // 3),

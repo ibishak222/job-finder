@@ -59,7 +59,7 @@ GDPR_TEXT = """
   profile so you can message them there yourself. Nothing is sent automatically; follow each site's rules and
   don't send bulk messages.
 * **Employers to contact** (care, health, kitchen, school and family-law/barrister searches): GP practices, care
-  homes, home-care agencies, restaurants, schools, chambers and similar near the postcode, from official open-data
+  homes, home-care providers, independent clinics, restaurants, schools, chambers and similar near the postcode, from official open-data
   registers - CQC, Care Inspectorate, NHS ODS, FSA food hygiene, DfE GIAS, Charity Commission, Bar Standards Board
   (all OGL) - and OpenStreetMap (ODbL). These are **organisations, not candidates**. Some rows also name a
   professional *from the register* (a registered manager, nurse prescriber, headteacher or barrister): they are
@@ -166,13 +166,13 @@ def _apply_chip() -> None:
 
 
 def with_mode(title: str, mode) -> str:
-    """'Locum / bank' searches for the locum version of the role (the search engine adds agencies, urgent care, OOH...)."""
+    """'Locum / bank' searches for the locum version of the role (the search engine puts urgent care, OOH, PCNs … first)."""
     if mode == "Locum / bank" and title and not _TEMP_WORD.search(title):
         return f"locum {title}"
     return title
 
 
-CAND_DEFAULTS = {"c_mode": "Any", "c_chip": None, "c_emp_f_locum": False, "c_emp_f_email": False, "c_emp_f_phone": False,
+CAND_DEFAULTS = {"c_emp_sector": "All", "c_mode": "Any", "c_chip": None, "c_emp_f_locum": False, "c_emp_f_email": False, "c_emp_f_phone": False,
                  "c_emp_f_page": False, "c_emp_sort": "Best match", "c_emp_type": "All", "c_github": True, "c_bsky": True, "c_masto": True, "c_osm": True, "c_epmc": False, "c_emp": True, "c_team_urls": "",
                  "c_f_contract": "Any", "c_uk_unknown": True, "c_enrich_n": 60, "c_obf": True, "c_f_contact": False, "c_f_near": False, "c_sites": True, "c_ads": True, "c_ads_presets": True, "c_hireable": False,
                  "c_unread": True, "c_unknown": False, "c_retention": 30, "c_max_profiles": 200, "c_max_accounts": 600,
@@ -185,7 +185,7 @@ def candidates_page():
     finish_task("cand_task", _apply)
     st.title("🧑‍💼 Candidates & employers")
     st.caption("People near a UK postcode (or anywhere in the UK) from **lawful public sources**, plus the **employers to "
-               "contact** for nursing, care, teaching, kitchen and trade roles, including locum, bank and agency routes. "
+               "contact** for nursing, care, teaching, kitchen and trade roles, including the direct employers that take locum and bank staff (never other recruiters). "
                "No LinkedIn/Indeed/Facebook scraping, no guessed emails.")
     st.markdown('<div class="jf-gdpr">🔐 <b>Personal data · UK GDPR applies.</b> Every email and phone shown is one the '
                 'person or organisation published themselves, with its source. Check the do-not-contact list before you '
@@ -203,8 +203,8 @@ def candidates_page():
                       help="A postcode (G1 1XQ, BT1 5GS, CF10 1EP, TR1 2HE …) or 'UK' to search England, Scotland, Wales "
                            "and Northern Ireland at once (no radius; a sample of the most contactable employers per area).")
         st.segmented_control("Contract", MODES, key="c_mode", selection_mode="single",
-                             help="Locum / bank searches for the locum version of the role and puts nursing agencies, "
-                                  "urgent care, out-of-hours providers, PCNs and GP federations first.")
+                             help="Locum / bank searches for the locum version of the role and puts the direct employers that take locum staff first: "
+                                  "urgent care, out-of-hours providers, PCNs, GP federations, hospices and independent clinics. Recruitment agencies are never listed.")
         with st.expander("Refine · radius, experience, keywords"):
             c3, c4 = st.columns(2)
             c3.slider("Radius (miles)", 1, 50, key="c_radius",
@@ -287,8 +287,8 @@ def candidates_page():
     show_notice("cand_task")
     if st.session_state.get("cand_results") is None and not (task and task.running):
         st.markdown(empty_state("Search to see people and employers here", "Pick a quick-start chip or type a job title and a "
-                                "postcode (or <b>UK</b>). For locum shifts choose <b>Locum / bank</b>: you get nursing agencies, "
-                                "urgent care, out-of-hours providers, PCNs and GP federations, with their published "
+                                "postcode (or <b>UK</b>). For locum shifts choose <b>Locum / bank</b>: you get the direct employers that take locum staff: "
+                                "urgent care, out-of-hours providers, PCNs, GP federations, hospices and independent clinics, with their published "
                                 "contacts and <i>join our bank</i> pages. A search takes 1–2 minutes."),
                     unsafe_allow_html=True)
     _results()
@@ -315,6 +315,8 @@ def _apply(t) -> None:
     st.session_state["cand_tech"] = res.tech_role
     st.session_state["cand_employers"] = [e.to_dict() for e in getattr(res, "employers", [])]
     st.session_state["cand_emp_note"] = getattr(res, "employers_note", "")
+    st.session_state["cand_agencies"] = int(getattr(res, "agencies_removed", 0) or 0)
+    st.session_state["c_emp_sector"] = "All"
     st.session_state["cand_research"] = getattr(res, "research_note", "")
     st.session_state.update({"c_f_show": "Everyone", "c_f_text": "", "c_f_hire": False, "c_f_phone": False,
                              "c_f_contract": "Any", "c_f_sort": "Best match", "c_f_near": False,
@@ -524,7 +526,7 @@ def _people_table(view: pd.DataFrame) -> None:
         "found_at": "Found at (UTC)"})
 
 
-EMPLOYER_COLUMNS = {"name": "Employer", "employer_type": "Type", "contact_name": "Named in register",
+EMPLOYER_COLUMNS = {"name": "Employer", "employer_type": "Type", "sector": "NHS / Independent", "contact_name": "Named in register",
                     "contact_role": "Their role (register)", "distance_miles": "Miles away", "address": "Address",
                     "postcode": "Postcode", "phone": "Phone", "email": "Email", "website": "Website",
                     "vacancy": "Open vacancy (own website)", "vacancy_type": "Vacancy type", "vacancy_url": "Vacancy link",
@@ -542,7 +544,7 @@ EMPLOYER_NOTICE = ("Employers to contact - organisations that employ this kind o
 def _emp_frame(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=EmployerLead.field_names())
     for c in ("name", "employer_type", "contact_name", "contact_role", "address", "postcode", "phone", "email",
-              "website", "source", "source_url", "ods_code", "note", "careers_url", "vacancy", "vacancy_url", "vacancy_type", "bank_url"):
+              "website", "source", "source_url", "ods_code", "note", "careers_url", "vacancy", "vacancy_url", "vacancy_type", "bank_url", "sector"):
         df[c] = df[c].fillna("")
     return df
 
@@ -562,7 +564,7 @@ def emp_exports(query: str) -> dict:
 
 
 def _locum_friendly(df: pd.DataFrame) -> pd.Series:
-    """Employers a locum / bank worker is booked through (agencies, urgent care, OOH, PCNs / federations, hubs)."""
+    """Employers a locum / bank worker is booked through (urgent care, OOH, PCNs / federations, hubs, hospices, trust banks)."""
     from recruit_scraper.candidates.employers import LOCUM_EMPLOYER
     hay = df["employer_type"] + " " + df["name"]
     return hay.map(lambda t: bool(LOCUM_EMPLOYER.search(t)))
@@ -575,23 +577,36 @@ def _employers(df: pd.DataFrame) -> None:
     st.subheader(f"🏥 Employers to contact ({len(df)})")
     n_named = int((df["contact_name"] != "").sum())
     st.caption("**Organisations, not candidates**: places that employ this kind of worker. Ask about vacancies, "
-               "agency / bank / locum staff or referrals. " + (st.session_state.get("cand_emp_note") or ""))
+               "bank / locum staff or referrals. " + (st.session_state.get("cand_emp_note") or ""))
     df = df.assign(_locum=_locum_friendly(df),
                    _reach=(df["phone"] != "").astype(int) + (df["email"] != "").astype(int)
                    + (df["bank_url"] != "").astype(int) + (df["careers_url"] != "").astype(int))
     locum_vac = df["vacancy_type"].str.startswith("locum")
     with st.container(key="metrics_emp"):
-        m = st.columns(6)
+        m = st.columns(7)
         m[0].metric("Employers", len(df))
         m[1].metric("Employers with phone", int((df["phone"] != "").sum()))
         m[2].metric("Employers with email", int((df["email"] != "").sum()))
         m[3].metric("Locum employers", int(df["_locum"].sum()),
-                    help="Nursing / locum agencies, urgent care, out-of-hours providers, PCNs, GP federations and hubs")
+                    help="Urgent care, out-of-hours providers, PCNs, GP federations, hubs, hospices, independent clinics (direct employers only; recruitment agencies are never listed)")
         m[4].metric("Locum vacancies", int(locum_vac.sum()),
                     help="Locum / bank / temporary adverts read from the employers' own websites")
         m[5].metric("Join-the-bank pages", int((df["bank_url"] != "").sum()))
+        m[6].metric("Independent", int((df["sector"] == "Independent").sum()),
+                    help="Private / independent clinics, hospitals and GP services from the regulators' registers "
+                         f"(CQC, HIW, RQIA). NHS-listed: {int((df['sector'] == 'NHS').sum())}")
 
+    if (df["sector"] != "").any():
+        st.segmented_control("NHS or independent", ["All", "NHS", "Independent"], key="c_emp_sector", selection_mode="single",
+                             help="NHS = NHS-contracted GP practices and NHS bodies (NHS ODS, PHS, HSC BSO lists); "
+                                  "Independent = private / independent clinics, hospitals and GP services from the "
+                                  "regulators' registers (CQC, Healthcare Inspectorate Wales, RQIA) and dental practices.")
+    sector = st.session_state.get("c_emp_sector") or "All"
+    if sector != "All":
+        df = df[df["sector"] == sector].reset_index(drop=True)
     kinds = ["All"] + list(dict.fromkeys(df["employer_type"]))
+    if st.session_state.get("c_emp_type") not in kinds:
+        st.session_state["c_emp_type"] = "All"
     st.radio("Type", kinds, horizontal=True, key="c_emp_type")
     pick = st.session_state.get("c_emp_type", "All")
     with st.expander("Filters & sort"):
@@ -630,6 +645,10 @@ def _employers(df: pd.DataFrame) -> None:
         st.caption(f"**{n_named}** rows name a professional from an official register (registered manager, nurse "
                    "prescriber, headteacher, barrister) - **not job-seekers**. Approach them as employers / for "
                    "referrals, and stop if they object.")
+    n_ag = int(st.session_state.get("cand_agencies") or 0)
+    if n_ag:
+        st.caption(f"🚫 {n_ag} recruitment / staffing / locum agenc{'ies' if n_ag != 1 else 'y'} left out: Job Finder "
+                   "lists direct employers only.")
     st.caption(f"Showing **{len(view)}** of {len(df)}.")
     if view.empty:
         st.markdown(empty_state("No employers match these filters", "Turn a filter off inside <i>Filters &amp; sort</i>, or "

@@ -35,11 +35,11 @@ def _terms(keyword: str, temporary_extra: tuple[str, ...] = ()) -> tuple[list[st
     from ..candidates.matching import RoleMatcher
     rm = RoleMatcher(keyword or "")
     core = rm.core or (keyword or "")
-    terms = [core] + [s for s in rm.search_terms(3)[1:]]
+    terms = [core] + [s for s in rm.search_terms(6)[1:]]
     temp = rm.contract == "temporary"
     if temp:
         terms += LOCUM_KEYWORDS.get(core, []) + list(temporary_extra)
-    return list(dict.fromkeys(t for t in terms if t)), temp
+    return list(dict.fromkeys(t for t in terms if t))[:8], temp
 
 
 class NHSScotlandSource(Source):
@@ -151,7 +151,7 @@ class HSCNIJobsSource(Source):
                 return
         terms, temp = _terms(self.keyword or "", ("nurse",))
         seen = set()
-        for t in terms[:6]:
+        for t in terms[:8]:
             try:
                 r = self.http.get(f"{self.BASE}/Search", params={"keyword": t}, headers={"Accept": "text/html"})
             except requests.RequestException as e:
